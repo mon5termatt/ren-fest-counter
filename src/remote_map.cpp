@@ -3,6 +3,7 @@
 #include "counters.h"
 #include "display.h"
 #include "idle_cycle.h"
+#include "setup_menu.h"
 #include "show_mode.h"
 #include <Preferences.h>
 #include <cstring>
@@ -28,6 +29,37 @@ namespace {
   constexpr uint8_t KNOWN_COUNT = sizeof(KNOWN_BUTTONS) / sizeof(KNOWN_BUTTONS[0]);
 
   RemoteMap::Binding bindings[KNOWN_COUNT];
+
+  // ON×3 then OFF×3 (≤1.5s between taps) opens setup.
+  // First ON unblanks immediately; further taps only advance the combo.
+  constexpr uint8_t COMBO_NEED = 3;
+  constexpr uint32_t COMBO_GAP_MS = 1500;
+  uint8_t comboOnCount = 0;
+  uint8_t comboOffCount = 0;
+  uint32_t comboLastMs = 0;
+  bool comboActive = false;
+  bool comboOnFired = false;  // first ON already ran UNBLANK
+
+  void clearComboArm() {
+    comboOnCount = 0;
+    comboOffCount = 0;
+    comboActive = false;
+    comboOnFired = false;
+  }
+
+  int findIndex(uint8_t buttonId);  // defined below
+
+  void execute(uint8_t action, uint8_t param, uint8_t effectIn, uint8_t effectOut,
+               uint8_t speed);  // defined below
+
+  void fireBindingIndex(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(KNOWN_COUNT)) return;
+    const RemoteMap::Binding& b = bindings[idx];
+    if (b.action != RemoteMap::ACTION_IDLE_START) {
+      IdleCycle::noteActivity();
+    }
+    execute(b.action, b.param, b.effectIn, b.effectOut, b.speed);
+  }
 
   int findIndex(uint8_t buttonId) {
     for (uint8_t i = 0; i < KNOWN_COUNT; i++) {
@@ -152,6 +184,17 @@ namespace {
         }
         break;
 
+      case RemoteMap::ACTION_IDLE_START:
+        if (IdleCycle::isCycling()) {
+          IdleCycle::noteActivity();
+          Serial.println(F("[wiz] idle stop"));
+        } else if (IdleCycle::startNow()) {
+          Serial.println(F("[wiz] idle start"));
+        } else {
+          Serial.println(F("[wiz] idle start failed"));
+        }
+        break;
+
       default:
         break;
     }
@@ -170,7 +213,10 @@ void begin() {
 }
 
 void loop() {
-  // Immediate taps — nothing deferred.
+  if (!comboActive) return;
+  if (static_cast<uint32_t>(millis() - comboLastMs) < COMBO_GAP_MS) return;
+  // Sequence timed out — first ON already unblanked; just drop the arm.
+  clearComboArm();
 }
 
 void load() {
@@ -219,13 +265,56 @@ void save() {
 }
 
 void handleButton(uint8_t buttonId) {
+  if (SetupMenu::active()) {
+    SetupMenu::handleButton(buttonId);
+    return;
+  }
+
   int idx = findIndex(buttonId);
   if (idx < 0) return;
 
-  IdleCycle::noteActivity();
+  // ON ON ON OFF OFF OFF (≤1.5s between taps) → setup menu.
+  // First ON unblanks right away; later ONs/OFFs only count toward the combo.
+  if (buttonId == WIZ_ON) {
+    if (comboOffCount > 0) {
+      // ON after OFF phase started — end prior attempt, start fresh.
+      clearComboArm();
+    }
+    if (!comboActive) {
+      comboActive = true;
+      comboOnCount = 0;
+      comboOffCount = 0;
+      comboOnFired = false;
+    }
+    if (comboOnCount >= COMBO_NEED) {
+      // Extra ON after 3 — restart the ON run (keep display unblanked).
+      comboOnCount = 0;
+      comboOffCount = 0;
+    }
+    comboOnCount++;
+    comboLastMs = millis();
+    if (!comboOnFired) {
+      comboOnFired = true;
+      fireBindingIndex(idx);  // immediate unblank
+    }
+    return;
+  }
 
-  const Binding& b = bindings[idx];
-  execute(b.action, b.param, b.effectIn, b.effectOut, b.speed);
+  if (buttonId == WIZ_OFF && comboActive && comboOnCount == COMBO_NEED) {
+    comboOffCount++;
+    comboLastMs = millis();
+    if (comboOffCount >= COMBO_NEED) {
+      clearComboArm();
+      SetupMenu::enter();
+    }
+    return;
+  }
+
+  if (comboActive) {
+    clearComboArm();  // already unblanked on first ON
+  }
+
+  fireBindingIndex(idx);
 }
 
 uint8_t bindingCount() { return KNOWN_COUNT; }
@@ -241,7 +330,7 @@ bool setBinding(uint8_t buttonId, uint8_t action, uint8_t param,
                 uint8_t effectIn, uint8_t effectOut, uint8_t speed) {
   int idx = findIndex(buttonId);
   if (idx < 0) return false;
-  if (action > ACTION_SCROLLER) return false;
+  if (action > ACTION_IDLE_START) return false;
   if (action == ACTION_SELECT && param >= MAX_COUNTERS) return false;
   bindings[idx].action = action;
   bindings[idx].param = param;
@@ -280,6 +369,7 @@ const char* actionLabel(uint8_t action) {
     case ACTION_BLANK: return "blank";
     case ACTION_UNBLANK: return "unblank";
     case ACTION_SCROLLER: return "scroller";
+    case ACTION_IDLE_START: return "idle_start";
     default: return "?";
   }
 }

@@ -2,6 +2,7 @@
 #include "config.h"
 #include "counters.h"
 #include "display.h"
+#include "setup_menu.h"
 
 namespace {
   uint32_t lastActivityMs = 0;
@@ -196,7 +197,33 @@ void noteActivity() {
 
 bool isCycling() { return cycling; }
 
+bool startNow() {
+  const uint8_t plLen = Counters::idlePlaylistLen();
+  if (plLen == 0 && enabledTotal() < 2) return false;
+  if (plLen > 0 && nextValidPlaylistIndex(0) < 0) return false;
+  if (Counters::blanked() && Counters::blankBrightnessPercent() == 0) return false;
+
+  // Drop any idle-owned marquee before restarting from the top.
+  stopIdleScroller();
+  cycling = true;
+  playlistCursor = 0;
+  msgCursor = 0;
+  cntCursor = 0;
+  waitScrollerPass = false;
+  prevOut = Counters::idleEffectOut();
+  Serial.println(F("[idle] start now"));
+  if (!advanceOnce()) {
+    cycling = false;
+    return false;
+  }
+  lastCycleMs = millis();
+  lastActivityMs = millis();
+  return true;
+}
+
 void loop() {
+  if (SetupMenu::active()) return;
+
   if (Display::scrollerActive() && !idleOwnsScroller) {
     return;
   }

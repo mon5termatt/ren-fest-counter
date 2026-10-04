@@ -4,7 +4,12 @@
 #include <Arduino.h>
 
 namespace Display {
-  void begin();
+  void begin();              // hardware / zones only
+  void playBootSplash();     // dual-line stats pages; timeout or remote
+  void showStatusLines(const char* top, const char* bottom);
+  // Setup OSD pixel tests (full chain). Checkerboard animates in Display::loop.
+  void showTestAllOn();
+  void showTestCheckerboard();
   void loop();
   void refreshAll();
   void refresh(uint8_t index);   // single-display: refreshes the shared panel

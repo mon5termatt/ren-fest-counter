@@ -96,6 +96,14 @@ void loop() {
   RemoteMap::handleButton(static_cast<uint8_t>(btn));
 }
 
+bool takeButton(uint8_t& buttonOut) {
+  int16_t btn = queuedButton;
+  if (btn < 0) return false;
+  queuedButton = -1;
+  buttonOut = static_cast<uint8_t>(btn);
+  return true;
+}
+
 const char* lastSeenMac() { return lastMac; }
 
 bool hasLastSeenMac() { return lastMac[0] != '\0'; }

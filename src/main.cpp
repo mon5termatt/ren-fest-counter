@@ -10,6 +10,7 @@
 #include "ota.h"
 #include "idle_cycle.h"
 #include "wifi_mgr.h"
+#include "setup_menu.h"
 
 namespace {
   uint32_t lastSaveMs = 0;
@@ -23,6 +24,7 @@ void setup() {
 
   Counters::begin();
   RemoteMap::begin();
+  SetupMenu::begin();
   Display::begin();
   IdleCycle::begin();
 
@@ -33,6 +35,7 @@ void setup() {
   Ota::begin();
   WebUI::begin();
 
+  Display::playBootSplash();
   Display::refreshAll();
 }
 

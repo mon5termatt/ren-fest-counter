@@ -20,20 +20,23 @@ ESP32 / Wi‑Fi overhead is included in these meter readings.
 Capacity labels are at **~3.7 V cell** voltage. Usable energy at **5 V USB**
 after boost (~85% efficient):
 
-| Bank | Label | ≈ Usable at 5 V |
-|------|-------|-----------------|
-| Small | 9000 mAh | ~5.6 Ah |
-| Baseus Amblight | 30 000 mAh 65 W | ~18–19 Ah |
+| Bank | Label | Cell energy | ≈ Usable at 5 V |
+|------|-------|-------------|-----------------|
+| Small | 9000 mAh | ~33 Wh | ~5.6 Ah |
+| Baseus Amblight | 30 000 mAh 65 W | **111 Wh** (rated) | ~18.9 Ah |
+
+111 Wh = 30 000 mAh × 3.7 V — same figure the pack claims. At 5 V with ~85%
+boost: `111 × 0.85 / 5 ≈ 18.9 Ah`.
 
 [Baseus Amblight 65W 30000mAh](https://www.baseus.com/products/amblight-power-bank-65w-30000mah)
 
 ## Runtime estimates
 
-| Load | 9000 mAh | One 30 K | Two 30 K (sequential) |
-|------|----------|----------|------------------------|
-| Full setup, min (0.4 A) | ~14 h | ~45–50 h | ~90–100 h |
-| Full setup, high (1.1 A) | ~5 h | ~16–18 h | ~32–36 h |
-| Checkerboard 2.0 A | ~2.8 h | ~9–10 h | ~18–20 h |
+| Load | 9000 mAh | One 30 K (111 Wh) | Two 30 K (sequential) |
+|------|----------|-------------------|------------------------|
+| Full setup, min (0.4 A) | ~14 h | ~47 h | ~94 h |
+| Full setup, high (1.1 A) | ~5 h | ~17 h | ~34 h |
+| Checkerboard 2.0 A | ~2.8 h | ~9.5 h | ~19 h |
 | All-on 3.1 A | ~1.8 h | ~6 h | ~12 h |
 
 Naive “mAh ÷ mA” without the 3.7→5 V conversion overstates runtime by ~1.5–1.6×.

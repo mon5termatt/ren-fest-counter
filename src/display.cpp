@@ -3,10 +3,14 @@
 #include "show_mode.h"
 #include "wiz_remote.h"
 #include "remote_map.h"
+#include "idle_cycle.h"
+#include "wifi_mgr.h"
+#include "wifi_config.h"
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
 #include <SPI.h>
 #include <cstring>
+#include <cstdio>
 
 namespace {
   constexpr MD_MAX72XX::moduleType_t HW = MD_MAX72XX::FC16_HW;
@@ -88,10 +92,9 @@ namespace {
     return nameZoneId();
   }
 
-  uint8_t percentToIntensity(uint8_t pct) {
-    if (pct == 0) return 0;
-    if (pct >= 100) return 15;
-    return static_cast<uint8_t>((pct * 15 + 50) / 100);
+  uint8_t percentToIntensity(uint8_t level) {
+    // blankBrightness is already MAX7219 0–15 (0 = off handled elsewhere).
+    return level > 15 ? 15 : level;
   }
 
   uint8_t effectiveIntensity() {
@@ -294,6 +297,21 @@ namespace {
     uint8_t colBuf[NAME_COL_BUF];
   } teeter;
 
+  // Bottom-zone teeter for status lines (SSID / etc.) — number strip, no flips.
+  struct BotTeeter {
+    bool active = false;
+    uint8_t zone = 0;
+    uint16_t zoneStart = 0;
+    uint16_t zoneCols = 0;
+    uint16_t textCols = 0;
+    uint16_t overflow = 0;
+    int16_t offset = 0;
+    int8_t dir = 1;
+    uint32_t nextMs = 0;
+    bool pausing = false;
+    uint8_t colBuf[NAME_COL_BUF];
+  } botTeeter;
+
   // Last static name blit (when not teetering) — restored after Parola number anims.
   bool nameStaticValid = false;
   int16_t nameStaticOrigin = 0;
@@ -312,6 +330,8 @@ namespace {
   char scrollerBottomBuf[SCROLLER_BOTTOM_MAX_LEN + 1] = "";
   textEffect_t scrollerDir = PA_SCROLL_LEFT;
   textEffect_t scrollerBottomDir = PA_SCROLL_LEFT;
+  uint16_t scrollerTopSpd = 6;
+  uint16_t scrollerBotSpd = 6;
   // Night / web Start: keep rotating through all scrollMessages until stopped.
   bool scrollerCycleAll = false;
   bool scrollerHolding = false;       // static message hold between advances
@@ -321,6 +341,15 @@ namespace {
   uint8_t scrollerCycleOutEff = ShowMode::LEFT;
   uint8_t scrollerCycleSpeed = 0;
   uint32_t scrollerHoldStartMs = 0;
+
+  // Setup-menu LED test patterns (full daisy-chain).
+  enum class TestPattern : uint8_t { Off = 0, AllOn, Checker };
+  TestPattern testPattern = TestPattern::Off;
+  uint8_t checkerPhase = 0;
+  uint32_t checkerNextMs = 0;
+  constexpr uint32_t CHECKER_PERIOD_MS = 280;
+
+  void clearTestPattern() { testPattern = TestPattern::Off; }
 
   void setNameModulesIntensity(uint8_t intensity) {
     MD_MAX72XX* mx = board->getGraphicObject();
@@ -336,8 +365,12 @@ namespace {
   }
 
   void stopNameTeeter() { teeter.active = false; }
+  void stopBotTeeter() { botTeeter.active = false; }
 
   void restoreNameBlit();  // after blit helpers
+  void blitBotTeeterFrame();
+  void tickBotTeeter();
+  void paintBotLine(uint8_t z, const char* text);
 
   // Declared later; used by non-scroll name transitions.
   bool runEffectAnim(uint8_t zone, const char* text, uint8_t effect,
@@ -362,6 +395,22 @@ namespace {
       }
     }
     return n;
+  }
+
+  // Full text width in columns (no buffer cap) — matches Parola getTextWidth
+  // with charSpacing=1 (spacing only after glyphs that drew).
+  uint16_t measureTextColumns(const char* text) {
+    MD_MAX72XX* mx = board->getGraphicObject();
+    if (!mx || !text) return 0;
+    uint16_t sum = 0;
+    for (const char* p = text; *p; p++) {
+      uint8_t glyph[10];
+      uint8_t w = mx->getChar(static_cast<uint8_t>(*p), sizeof(glyph), glyph);
+      if (w > sizeof(glyph)) w = sizeof(glyph);
+      sum = static_cast<uint16_t>(sum + w);
+      if (w != 0 && *(p + 1)) sum = static_cast<uint16_t>(sum + 1);
+    }
+    return sum;
   }
 
   // origin = source column of the leftmost visible pixel (negative pads left).
@@ -605,40 +654,62 @@ namespace {
       mx->update();
     }
 
-    uint16_t period = parolaScrollSpeed(40);
-    if (period < 1) period = 1;
+    // Bind to the Piling slider directly. Period alone can't go faster than one
+    // SPI update per row — high speeds must skip rows (stride), like Animation.
+    useAnimSpeed(Counters::effectSpeed(ShowMode::PILING));
+    uint8_t s = currentAnimSpeed;
+    if (s < 1) s = 1;
+    if (s > 20) s = 20;
+    // s=1 → 1 row/tick (~full 8-step falls); s=20 → 4 rows/tick (~2× prior max).
+    const uint8_t stride = static_cast<uint8_t>(1 + (s - 1) / 5);
+    // Inter-tick pause: s=1 → 28ms, s=20 → 2ms (then catch-up after polls).
+    uint16_t period = static_cast<uint16_t>(30 - s);
+    if (period < 2) period = 2;
 
-    // Device bit for visual bottom / top (name strip is FLIP_UD).
-    const int bottomBit = NAME_ZONE_FLIP_UD ? 7 : 0;
-    const int topBit = NAME_ZONE_FLIP_UD ? 0 : 7;
-    const int fallDir = NAME_ZONE_FLIP_UD ? 1 : -1;   // top → bottom
-    const int pileDir = NAME_ZONE_FLIP_UD ? -1 : 1;   // bottom → top (stack order)
+    // Per-zone device bits: only the name strip uses FLIP_UD.
+    struct ZoneOri {
+      int bottomBit;
+      int topBit;
+      int fallDir;  // top → bottom
+      int pileDir;  // bottom → top (stack order)
+    };
+    auto oriFor = [](bool flipUD) -> ZoneOri {
+      return ZoneOri{
+          flipUD ? 7 : 0,
+          flipUD ? 0 : 7,
+          flipUD ? 1 : -1,
+          flipUD ? -1 : 1,
+      };
+    };
+    // Out uses steady-state orientation; in is reversed (matches visual hardware).
+    const ZoneOri nOri = oriFor(entering ? !NAME_ZONE_FLIP_UD : NAME_ZONE_FLIP_UD);
+    const ZoneOri cOri = oriFor(entering);  // number strip: flip only for pile-in
 
-    auto layerHasInk = [&](int targetBit) -> bool {
+    auto layerHasInk = [&](const uint8_t* snap, uint16_t cols, int targetBit) -> bool {
       const uint8_t m = static_cast<uint8_t>(1u << targetBit);
-      for (uint16_t i = 0; i < nCols; i++) {
-        if (nSnap[i] & m) return true;
-      }
-      for (uint16_t i = 0; i < cCols; i++) {
-        if (cSnap[i] & m) return true;
+      for (uint16_t i = 0; i < cols; i++) {
+        if (snap[i] & m) return true;
       }
       return false;
     };
 
-    auto paintFrame = [&](uint8_t settledMask, int fallBit, int targetBit, bool showFall) {
-      auto paint = [&](uint16_t start, uint16_t cols, const uint8_t* snap) {
-        const uint8_t fallMask = static_cast<uint8_t>(1u << fallBit);
-        const uint8_t tgtMask = static_cast<uint8_t>(1u << targetBit);
-        for (uint16_t i = 0; i < cols; i++) {
-          uint8_t out = static_cast<uint8_t>(snap[i] & settledMask);
-          if (showFall && (snap[i] & tgtMask)) {
-            out = static_cast<uint8_t>(out | fallMask);
-          }
-          mx->setColumn(start + i, out);
+    auto paintZone = [&](uint16_t start, uint16_t cols, const uint8_t* snap,
+                         uint8_t settledMask, int fallBit, int targetBit, bool showFall) {
+      const uint8_t fallMask = static_cast<uint8_t>(1u << fallBit);
+      const uint8_t tgtMask = static_cast<uint8_t>(1u << targetBit);
+      for (uint16_t i = 0; i < cols; i++) {
+        uint8_t out = static_cast<uint8_t>(snap[i] & settledMask);
+        if (showFall && (snap[i] & tgtMask)) {
+          out = static_cast<uint8_t>(out | fallMask);
         }
-      };
-      paint(nStart, nCols, nSnap);
-      paint(cStart, cCols, cSnap);
+        mx->setColumn(start + i, out);
+      }
+    };
+
+    auto paintFrame = [&](uint8_t nSettled, int nFall, int nTarget, uint8_t cSettled,
+                          int cFall, int cTarget, bool showFall) {
+      paintZone(nStart, nCols, nSnap, nSettled, nFall, nTarget, showFall);
+      paintZone(cStart, cCols, cSnap, cSettled, cFall, cTarget, showFall);
       mx->update();
     };
 
@@ -659,44 +730,68 @@ namespace {
       }
     };
 
+    auto nextY = [&](int y, int yEnd) -> int {
+      if (y >= yEnd) return yEnd + 1;
+      const int n = y + static_cast<int>(stride);
+      if (n >= yEnd) return yEnd;  // always land on the target row
+      return n;
+    };
+
     if (entering) {
-      uint8_t settledMask = 0;
+      uint8_t nSettled = 0;
+      uint8_t cSettled = 0;
       for (int layer = 0; layer < 8; layer++) {
-        const int targetBit = bottomBit + pileDir * layer;
-        if (!layerHasInk(targetBit)) {
-          settledMask = static_cast<uint8_t>(settledMask | (1u << targetBit));
+        const int nTarget = nOri.bottomBit + nOri.pileDir * layer;
+        const int cTarget = cOri.bottomBit + cOri.pileDir * layer;
+        const bool ink = layerHasInk(nSnap, nCols, nTarget) ||
+                         layerHasInk(cSnap, cCols, cTarget);
+        if (!ink) {
+          nSettled = static_cast<uint8_t>(nSettled | (1u << nTarget));
+          cSettled = static_cast<uint8_t>(cSettled | (1u << cTarget));
           continue;
         }
-        // Drop this row from top down onto the pile.
-        for (int y = topBit; ; y += fallDir) {
+        const int yEnd = (nTarget > nOri.topBit) ? (nTarget - nOri.topBit)
+                                                 : (nOri.topBit - nTarget);
+        for (int y = 0; y <= yEnd; y = nextY(y, yEnd)) {
           if (!waitTick()) return false;
-          paintFrame(settledMask, y, targetBit, true);
-          if (y == targetBit) break;
+          const int nFall = nOri.topBit + nOri.fallDir * y;
+          const int cFall = cOri.topBit + cOri.fallDir * y;
+          paintFrame(nSettled, nFall, nTarget, cSettled, cFall, cTarget, true);
+          if (y == yEnd) break;
         }
-        settledMask = static_cast<uint8_t>(settledMask | (1u << targetBit));
+        nSettled = static_cast<uint8_t>(nSettled | (1u << nTarget));
+        cSettled = static_cast<uint8_t>(cSettled | (1u << cTarget));
       }
       for (uint16_t i = 0; i < nCols; i++) mx->setColumn(nStart + i, nSnap[i]);
       for (uint16_t i = 0; i < cCols; i++) mx->setColumn(cStart + i, cSnap[i]);
       mx->update();
     } else {
-      // Unpile: top settled row lifts off upward.
-      uint8_t settledMask = 0xFF;
+      uint8_t nSettled = 0xFF;
+      uint8_t cSettled = 0xFF;
       for (int layer = 7; layer >= 0; layer--) {
-        const int targetBit = bottomBit + pileDir * layer;
-        if (!layerHasInk(targetBit)) {
-          settledMask = static_cast<uint8_t>(settledMask & ~(1u << targetBit));
+        const int nTarget = nOri.bottomBit + nOri.pileDir * layer;
+        const int cTarget = cOri.bottomBit + cOri.pileDir * layer;
+        const bool ink = layerHasInk(nSnap, nCols, nTarget) ||
+                         layerHasInk(cSnap, cCols, cTarget);
+        if (!ink) {
+          nSettled = static_cast<uint8_t>(nSettled & ~(1u << nTarget));
+          cSettled = static_cast<uint8_t>(cSettled & ~(1u << cTarget));
           continue;
         }
-        settledMask = static_cast<uint8_t>(settledMask & ~(1u << targetBit));
-        for (int y = targetBit; ; y -= fallDir) {
+        nSettled = static_cast<uint8_t>(nSettled & ~(1u << nTarget));
+        cSettled = static_cast<uint8_t>(cSettled & ~(1u << cTarget));
+        const int yEnd = (nTarget > nOri.topBit) ? (nTarget - nOri.topBit)
+                                                 : (nOri.topBit - nTarget);
+        for (int y = 0; y <= yEnd; y = nextY(y, yEnd)) {
           if (!waitTick()) return false;
-          paintFrame(settledMask, y, targetBit, true);
-          if (y == topBit) {
-            if (!waitTick()) return false;
-            paintFrame(settledMask, y, targetBit, false);
-            break;
-          }
+          const int nFall = nTarget - nOri.fallDir * y;
+          const int cFall = cTarget - cOri.fallDir * y;
+          paintFrame(nSettled, nFall, nTarget, cSettled, cFall, cTarget, true);
+          if (y == yEnd) break;
         }
+        if (!waitTick()) return false;
+        paintFrame(nSettled, nOri.topBit, nTarget, cSettled, cOri.topBit, cTarget,
+                   false);
       }
       board->displayClear();
     }
@@ -1394,6 +1489,90 @@ namespace {
     blitTeeterFrame();
   }
 
+  void blitBotTeeterFrame() {
+    if (!botTeeter.active) return;
+    blitZoneColumns(botTeeter.zoneStart, botTeeter.zoneCols, botTeeter.colBuf,
+                    botTeeter.textCols, botTeeter.offset, false, false, true);
+  }
+
+  void tickBotTeeter() {
+    if (!botTeeter.active || botTeeter.overflow == 0) return;
+    const uint32_t now = millis();
+    if (static_cast<int32_t>(now - botTeeter.nextMs) < 0) return;
+
+    if (botTeeter.pausing) {
+      botTeeter.pausing = false;
+      botTeeter.nextMs = now + teeterFrameMs();
+      return;
+    }
+
+    botTeeter.offset = static_cast<int16_t>(botTeeter.offset + botTeeter.dir);
+    if (botTeeter.offset >= static_cast<int16_t>(botTeeter.overflow)) {
+      botTeeter.offset = static_cast<int16_t>(botTeeter.overflow);
+      botTeeter.dir = -1;
+      botTeeter.pausing = true;
+      botTeeter.nextMs = now + TEETER_END_PAUSE_MS;
+    } else if (botTeeter.offset <= 0) {
+      botTeeter.offset = 0;
+      botTeeter.dir = 1;
+      botTeeter.pausing = true;
+      botTeeter.nextMs = now + TEETER_END_PAUSE_MS;
+    } else {
+      botTeeter.nextMs = now + teeterFrameMs();
+    }
+    blitBotTeeterFrame();
+  }
+
+  void paintBotStatic(uint8_t z, const uint8_t* colBuf, uint16_t textCols) {
+    uint16_t startCol = 0, endCol = 0;
+    board->getDisplayExtent(z, startCol, endCol);
+    const uint16_t zCols = zoneWidthCols(z);
+    const int16_t origin =
+        (textCols >= zCols) ? 0
+                            : static_cast<int16_t>(-((static_cast<int16_t>(zCols) -
+                                                      static_cast<int16_t>(textCols)) /
+                                                     2));
+    botTeeter.zone = z;
+    botTeeter.zoneStart = startCol;
+    botTeeter.zoneCols = zCols;
+    botTeeter.textCols = textCols;
+    if (colBuf != botTeeter.colBuf && textCols > 0) {
+      memcpy(botTeeter.colBuf, colBuf, textCols);
+    }
+    blitZoneColumns(startCol, zCols, botTeeter.colBuf, textCols, origin, false, false,
+                    true);
+  }
+
+  void startBotTeeter(uint8_t z, const char* text) {
+    uint16_t startCol = 0, endCol = 0;
+    board->getDisplayExtent(z, startCol, endCol);
+    const uint16_t zCols = zoneWidthCols(z);
+    const uint16_t tCols = buildNameColumns(text, botTeeter.colBuf, NAME_COL_BUF);
+    botTeeter.active = true;
+    botTeeter.zone = z;
+    botTeeter.zoneStart = startCol;
+    botTeeter.zoneCols = zCols;
+    botTeeter.textCols = tCols;
+    botTeeter.overflow = (tCols > zCols) ? static_cast<uint16_t>(tCols - zCols) : 0;
+    botTeeter.offset = 0;
+    botTeeter.dir = 1;
+    botTeeter.pausing = true;
+    botTeeter.nextMs = millis() + TEETER_END_PAUSE_MS;
+    blitBotTeeterFrame();
+  }
+
+  void paintBotLine(uint8_t z, const char* text) {
+    const uint16_t tCols = buildNameColumns(text, botTeeter.colBuf, NAME_COL_BUF);
+    const uint16_t zCols = zoneWidthCols(z);
+    if (tCols <= zCols) {
+      stopBotTeeter();
+      paintBotStatic(z, botTeeter.colBuf, tCols);
+    } else {
+      board->displayClear(z);
+      startBotTeeter(z, text);
+    }
+  }
+
   void paintNameOnly() {
     const int8_t nz = nameZoneId();
     if (nz < 0) return;
@@ -1412,6 +1591,7 @@ namespace {
     formatCount(c.count);
 
     stopNameTeeter();
+    stopBotTeeter();
     board->displayClear();
 
     const int8_t nz = nameZoneId();
@@ -1437,6 +1617,7 @@ namespace {
   void applyBlankState() {
     if (!inited || !board) return;
     scrollerOn = false;
+    clearTestPattern();
 
     if (!Counters::blanked()) {
       board->displayShutdown(false);
@@ -1779,16 +1960,38 @@ namespace {
     scrollerBottomZone = scrollerHasBottom ? static_cast<uint8_t>(cz) : 0;
 
     uint8_t fitBuf[NAME_COL_BUF];
-    const uint16_t topCols = buildNameColumns(scrollerBuf, fitBuf, NAME_COL_BUF);
+    // fitBuf only decides scroll-vs-static; measure full width for pass timing.
+    const uint16_t topFitCols = buildNameColumns(scrollerBuf, fitBuf, NAME_COL_BUF);
     const uint16_t topZoneCols = zoneWidthCols(scrollerZone);
-    scrollerTopScrolls = (topCols > topZoneCols);
+    const uint16_t topCols = measureTextColumns(scrollerBuf);
+    scrollerTopScrolls = (topCols > topZoneCols) || (topFitCols > topZoneCols);
 
+    uint16_t botCols = 0;
+    uint16_t botZoneCols = 0;
     scrollerBottomScrolls = false;
     if (scrollerHasBottom) {
       uint8_t botFit[64];
-      const uint16_t botCols = buildNameColumns(scrollerBottomBuf, botFit, sizeof(botFit));
-      const uint16_t botZoneCols = zoneWidthCols(scrollerBottomZone);
+      (void)buildNameColumns(scrollerBottomBuf, botFit, sizeof(botFit));
+      botZoneCols = zoneWidthCols(scrollerBottomZone);
+      botCols = measureTextColumns(scrollerBottomBuf);
       scrollerBottomScrolls = (botCols > botZoneCols);
+    }
+
+    // Parola HScroll IN≈textCols + OUT≈zoneCols. Scale bottom tick so both
+    // passes finish together (long top → much slower bottom).
+    scrollerTopSpd = parolaScrollSpeed(40);
+    scrollerBotSpd = scrollerTopSpd;
+    if (scrollerTopScrolls && scrollerBottomScrolls) {
+      const uint32_t topDist = static_cast<uint32_t>(topCols) + topZoneCols;
+      const uint32_t botDist = static_cast<uint32_t>(botCols) + botZoneCols;
+      if (botDist > 0 && topDist > botDist) {
+        uint32_t scaled =
+            (static_cast<uint32_t>(scrollerTopSpd) * topDist + (botDist / 2)) /
+            botDist;
+        if (scaled < scrollerTopSpd) scaled = scrollerTopSpd;
+        if (scaled > 2000) scaled = 2000;
+        scrollerBotSpd = static_cast<uint16_t>(scaled);
+      }
     }
 
     scrollerOn = true;
@@ -1801,11 +2004,10 @@ namespace {
     board->setIntensity(effectiveIntensity());
     board->displayClear();
 
-    const uint16_t spd = parolaScrollSpeed(40);
     board->setCharSpacing(scrollerZone, 1);
     if (scrollerTopScrolls) {
-      board->displayZoneText(scrollerZone, scrollerBuf, PA_LEFT, spd, 0, scrollerDir,
-                             scrollerDir);
+      board->displayZoneText(scrollerZone, scrollerBuf, PA_LEFT, scrollerTopSpd, 0,
+                             scrollerDir, scrollerDir);
     } else {
       board->displayZoneText(scrollerZone, scrollerBuf, PA_CENTER, 0, 0, PA_PRINT,
                              PA_NO_EFFECT);
@@ -1817,11 +2019,12 @@ namespace {
       if (scrollerHasBottom) {
         board->setCharSpacing(scrollerBottomZone, 1);
         if (scrollerBottomScrolls) {
-          board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_LEFT, spd, 0,
-                                 scrollerBottomDir, scrollerBottomDir);
+          board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_LEFT,
+                                 scrollerBotSpd, 0, scrollerBottomDir,
+                                 scrollerBottomDir);
         } else {
-          board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_CENTER, 0, 0,
-                                 PA_PRINT, PA_NO_EFFECT);
+          board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_CENTER, 0,
+                                 0, PA_PRINT, PA_NO_EFFECT);
         }
         board->displayReset(scrollerBottomZone);
       }
@@ -1834,19 +2037,18 @@ namespace {
     scrollerBotPassLatched = !scrollerBottomScrolls;
     scrollerPassDone = false;
     scrollerHolding = false;
-    const uint16_t spd = parolaScrollSpeed(40);
     if (scrollerTopScrolls) {
       board->displayClear(scrollerZone);
       board->setCharSpacing(scrollerZone, 1);
-      board->displayZoneText(scrollerZone, scrollerBuf, PA_LEFT, spd, 0, scrollerDir,
-                             scrollerDir);
+      board->displayZoneText(scrollerZone, scrollerBuf, PA_LEFT, scrollerTopSpd, 0,
+                             scrollerDir, scrollerDir);
       board->displayReset(scrollerZone);
     }
     if (scrollerBottomScrolls && scrollerHasBottom) {
       board->displayClear(scrollerBottomZone);
       board->setCharSpacing(scrollerBottomZone, 1);
-      board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_LEFT, spd, 0,
-                             scrollerBottomDir, scrollerBottomDir);
+      board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_LEFT,
+                             scrollerBotSpd, 0, scrollerBottomDir, scrollerBottomDir);
       board->displayReset(scrollerBottomZone);
     }
   }
@@ -1930,8 +2132,11 @@ namespace Display {
 
 uint8_t primaryBoard() { return 0; }
 
-// Forward — used by idleShowNext / stopManualScroller
+// Forward — used by idleShowNext / stopManualScroller / boot splash
 void haltScrollerEngine();
+void startManualScroller(uint8_t effectIn, const char* text, const char* bottom,
+                         uint8_t effectOut, uint8_t speed);
+void stopManualScroller(bool restore);
 
 void begin() {
   SPI.begin(PIN_CLK, -1, PIN_DIN, -1);
@@ -1956,9 +2161,176 @@ void begin() {
   board->setIntensity(effectiveIntensity());
   board->displayClear();
   inited = true;
+}
 
+void showStatusLines(const char* top, const char* bottom) {
+  if (!inited || !board) return;
+  clearTestPattern();
+  if (scrollerOn) {
+    haltScrollerEngine();
+  }
+  stopNameTeeter();
+  stopBotTeeter();
+  nameStaticValid = false;
+  beginAnim(AnimSlot::Name);
+  beginAnim(AnimSlot::Num);
+
+  board->displayShutdown(false);
+  board->setIntensity(effectiveIntensity());
+  board->displayClear();
+
+  const int8_t nz = nameZoneId();
+  const int8_t cz = numberZone();
+  const char* t = (top && top[0]) ? top : " ";
+  const char* b = (bottom && bottom[0]) ? bottom : " ";
+
+  // Bottom first (same reason as paintContent), then top — teeter if cut off.
+  if (cz >= 0) {
+    paintBotLine(static_cast<uint8_t>(cz), b);
+  }
+  if (nz >= 0) {
+    paintName(static_cast<uint8_t>(nz), t);
+  }
+}
+
+void playBootSplash() {
+  if (!inited || !board) return;
+  IdleCycle::noteActivity();
   playBootAnimation();
-  refreshAll();
+
+  constexpr uint32_t kBudgetMs = 10000;
+  constexpr uint32_t kHoldMs = 2000;
+  const uint32_t tStart = millis();
+
+  auto abortOrBudget = [&]() -> bool {
+    uint8_t btn = 0;
+    if (WizRemote::takeButton(btn)) return true;
+    return (millis() - tStart) >= kBudgetMs;
+  };
+
+  auto showPage = [&](const char* top, const char* bot) -> bool {
+    if (abortOrBudget()) return true;
+
+    char topBuf[SCROLLER_MAX_LEN + 1];
+    char botBuf[SCROLLER_BOTTOM_MAX_LEN + 1];
+    strncpy(topBuf, top ? top : " ", SCROLLER_MAX_LEN);
+    topBuf[SCROLLER_MAX_LEN] = '\0';
+    strncpy(botBuf, bot ? bot : " ", SCROLLER_BOTTOM_MAX_LEN);
+    botBuf[SCROLLER_BOTTOM_MAX_LEN] = '\0';
+
+    showStatusLines(topBuf, botBuf);
+
+    const uint32_t pageStart = millis();
+    while ((millis() - pageStart) < kHoldMs) {
+      if (abortOrBudget()) {
+        stopNameTeeter();
+        stopBotTeeter();
+        return true;
+      }
+      WifiMgr::loop();
+      tickNameTeeter();
+      tickBotTeeter();
+      yield();
+    }
+    return false;
+  };
+
+  char top[24];
+  char bot[SCROLLER_BOTTOM_MAX_LEN + 1];
+
+  // SoftAP: IP on wide top, SSID on bottom.
+  {
+    String ip = WifiMgr::apIp();
+    snprintf(top, sizeof(top), "%s", ip.c_str());
+    if (showPage(top, AP_SSID)) goto done;
+  }
+
+  // STA: IP top, network name bottom.
+  if (WifiMgr::staConnected()) {
+    String sip = WifiMgr::staIp();
+    snprintf(top, sizeof(top), "%s", sip.c_str());
+    const char* ssid = WifiMgr::staSsid();
+    if (showPage(top, (ssid && ssid[0]) ? ssid : "STA")) goto done;
+  } else {
+    if (showPage("-", "none")) goto done;
+  }
+
+  {
+    const char* linked = Counters::linkedRemoteMac();
+    const char* seen = WizRemote::lastSeenMac();
+    const char* id = (linked && linked[0]) ? linked
+                     : (seen && seen[0])   ? seen
+                                           : "-";
+    if (showPage(id, "remote")) goto done;
+  }
+
+  {
+    snprintf(bot, sizeof(bot), "%u on", static_cast<unsigned>(Counters::enabledCount()));
+    const Counter& c = Counters::getConst(Counters::activeIndex());
+    if (c.name[0]) {
+      if (showPage(c.name, bot)) goto done;
+    } else {
+      if (showPage("Counters", bot)) goto done;
+    }
+  }
+
+done:
+  if (scrollerOn) stopManualScroller(false);
+  IdleCycle::noteActivity();
+  Serial.println(F("[display] boot splash done"));
+}
+
+void showTestAllOn() {
+  if (!inited || !board) return;
+  if (scrollerOn) haltScrollerEngine();
+  stopNameTeeter();
+  stopBotTeeter();
+  nameStaticValid = false;
+  beginAnim(AnimSlot::Name);
+  beginAnim(AnimSlot::Num);
+
+  testPattern = TestPattern::AllOn;
+  board->displayShutdown(false);
+  board->setIntensity(Counters::intensity());
+
+  MD_MAX72XX* mx = board->getGraphicObject();
+  if (!mx) return;
+  const uint16_t cols = static_cast<uint16_t>(MODULES_PER_BOARD) * 8u;
+  for (uint16_t c = 0; c < cols; c++) {
+    mx->setColumn(c, 0xFF);
+  }
+  mx->update();
+}
+
+void showTestCheckerboard() {
+  if (!inited || !board) return;
+  if (scrollerOn) haltScrollerEngine();
+  stopNameTeeter();
+  stopBotTeeter();
+  nameStaticValid = false;
+  beginAnim(AnimSlot::Name);
+  beginAnim(AnimSlot::Num);
+
+  testPattern = TestPattern::Checker;
+  checkerPhase = 0;
+  checkerNextMs = millis() + CHECKER_PERIOD_MS;
+  board->displayShutdown(false);
+  board->setIntensity(Counters::intensity());
+
+  MD_MAX72XX* mx = board->getGraphicObject();
+  if (!mx) return;
+  const uint16_t cols = static_cast<uint16_t>(MODULES_PER_BOARD) * 8u;
+  for (uint16_t c = 0; c < cols; c++) {
+    uint8_t bits = 0;
+    for (uint8_t r = 0; r < 8; r++) {
+      // 2×2 checker cells; phase flips black/white.
+      if ((((c >> 1) + (r >> 1) + checkerPhase) & 1u) == 0u) {
+        bits = static_cast<uint8_t>(bits | (1u << r));
+      }
+    }
+    mx->setColumn(c, bits);
+  }
+  mx->update();
 }
 
 void loop() {
@@ -1968,6 +2340,31 @@ void loop() {
     flashOn = false;
     board->setInvert(false);
     applyBlankState();
+  }
+
+  if (testPattern == TestPattern::Checker) {
+    if (static_cast<int32_t>(millis() - checkerNextMs) >= 0) {
+      checkerPhase ^= 1u;
+      checkerNextMs = millis() + CHECKER_PERIOD_MS;
+      MD_MAX72XX* mx = board->getGraphicObject();
+      if (mx) {
+        const uint16_t cols = static_cast<uint16_t>(MODULES_PER_BOARD) * 8u;
+        for (uint16_t c = 0; c < cols; c++) {
+          uint8_t bits = 0;
+          for (uint8_t r = 0; r < 8; r++) {
+            if ((((c >> 1) + (r >> 1) + checkerPhase) & 1u) == 0u) {
+              bits = static_cast<uint8_t>(bits | (1u << r));
+            }
+          }
+          mx->setColumn(c, bits);
+        }
+        mx->update();
+      }
+    }
+    return;
+  }
+  if (testPattern == TestPattern::AllOn) {
+    return;
   }
 
   if (!displayVisible()) return;
@@ -2011,10 +2408,10 @@ void loop() {
     return;
   }
 
-  if (teeter.active) {
-    // Direct column blit for name; avoid Parola animate (it would overwrite name).
-    // Number zone pixels remain in the MAX72XX buffer across updates.
+  if (teeter.active || botTeeter.active) {
+    // Direct column blit; avoid Parola animate (it would overwrite teeter pixels).
     tickNameTeeter();
+    tickBotTeeter();
   } else {
     board->displayAnimate();
   }

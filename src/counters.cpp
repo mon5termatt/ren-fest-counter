@@ -9,7 +9,7 @@ namespace {
   uint8_t activeIdx = 0;
   uint8_t ledIntensity = DEFAULT_INTENSITY;
   bool displaysBlanked = false;
-  uint8_t blankBrightPct = 0;  // 0 = full off, 1–100 = dim %
+  uint8_t blankBrightPct = 0;  // 0 = full off, 1–15 = MAX7219 intensity when blanked
   char linkedMac[13] = "";
   uint8_t idleEffIn = ShowMode::LEFT;
   uint8_t idleEffOut = ShowMode::LEFT;
@@ -116,7 +116,11 @@ void load() {
   if (ledIntensity > 15) ledIntensity = 15;
   displaysBlanked = prefs.getBool("blanked", false);
   blankBrightPct = prefs.getUChar("blankPct", 0);
-  if (blankBrightPct > 100) blankBrightPct = 100;
+  // Legacy: values 16–100 were percent; map to 0–15 intensity.
+  if (blankBrightPct > 15) {
+    if (blankBrightPct >= 100) blankBrightPct = 15;
+    else blankBrightPct = static_cast<uint8_t>((blankBrightPct * 15 + 50) / 100);
+  }
   activeIdx = prefs.getUChar("active", 0);
   if (activeIdx >= MAX_COUNTERS) activeIdx = 0;
 
@@ -405,7 +409,11 @@ void setBlanked(bool blanked) {
 uint8_t blankBrightnessPercent() { return blankBrightPct; }
 
 void setBlankBrightnessPercent(uint8_t percent) {
-  if (percent > 100) percent = 100;
+  // Accept legacy percent (16–100) from older web clients / NVS.
+  if (percent > 15) {
+    if (percent >= 100) percent = 15;
+    else percent = static_cast<uint8_t>((percent * 15 + 50) / 100);
+  }
   blankBrightPct = percent;
   markDirty();
 }

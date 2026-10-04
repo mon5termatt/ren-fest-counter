@@ -11,6 +11,7 @@ namespace RemoteMap {
     ACTION_BLANK = 4,
     ACTION_UNBLANK = 5,
     ACTION_SCROLLER = 6,    // toggle cycling marquee of all scrollMessages
+    ACTION_IDLE_START = 7,  // start idle playlist immediately (toggle off if running)
   };
 
   struct Binding {

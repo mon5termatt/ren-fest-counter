@@ -50,6 +50,7 @@ namespace Counters {
   bool blanked();
   void setBlanked(bool blanked);
 
+  // 0 = full off (shutdown), 1–15 = MAX7219 intensity while blanked
   uint8_t blankBrightnessPercent();
   void setBlankBrightnessPercent(uint8_t percent);
 

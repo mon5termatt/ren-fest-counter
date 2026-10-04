@@ -88,8 +88,8 @@ namespace {
         <div class="checks">
           <label><input type="checkbox" id="blanked"/> Blanked</label>
         </div>
-        <label for="blankPct">Blank brightness % (0 = full off)</label>
-        <input id="blankPct" type="number" min="0" max="100" title="0 shuts the MAX7219 off; 1–100 dims to that percent"/>
+        <label for="blankPct">Blank brightness (0 = OFF, 1–15)</label>
+        <input id="blankPct" type="number" min="0" max="15" title="0 shuts the MAX7219 off; 1–15 = intensity while blanked"/>
       </div>
     </div>
     <p>Active counter (remote ±): <strong id="activeLabel">—</strong></p>
@@ -177,7 +177,7 @@ namespace {
       <button type="button" class="secondary" id="btnUnlink">Clear link</button>
     </div>
     <h2 style="margin-top:1.25rem">Key map</h2>
-    <p class="sub" style="margin:0 0 .5rem">Tap fires immediately. In = enter / play; Out = exit when leaving. Speed 0 = anim default (1–20).</p>
+    <p class="sub" style="margin:0 0 .5rem">Tap fires immediately. In = enter / play; Out = exit when leaving. Speed 0 = anim default (1–20). Setup: ON×3 then OFF×3 (quick taps).</p>
     <table>
       <thead><tr><th>Button</th><th>Tap</th><th>Counter</th><th>In</th><th>Out</th><th>Speed</th></tr></thead>
       <tbody id="keymap"></tbody>
@@ -235,7 +235,8 @@ const ACTION_OPTS = [
   {v:3,t:'dec_active'},
   {v:4,t:'blank'},
   {v:5,t:'unblank'},
-  {v:6,t:'scroller'}
+  {v:6,t:'scroller'},
+  {v:7,t:'idle_start'}
 ];
 const ANIM_OPTS = [
   {v:0,t:'Left'},
