@@ -11,7 +11,8 @@ namespace {
   bool displaysBlanked = false;
   uint8_t blankBrightPct = 0;  // 0 = full off, 1–100 = dim %
   char linkedMac[13] = "";
-  uint8_t idleEff = ShowMode::LEFT;
+  uint8_t idleEffIn = ShowMode::LEFT;
+  uint8_t idleEffOut = ShowMode::LEFT;
   uint8_t localIncEff = ShowMode::UP;
   uint8_t localDecEff = ShowMode::DOWN;
   uint8_t idleCycleSec = 5;
@@ -19,6 +20,7 @@ namespace {
   uint8_t scrollSpd = 5;
   uint8_t teeterSpd = 5;
   char scrollMessages[MAX_SCROLL_MESSAGES][SCROLLER_MAX_LEN + 1];
+  char scrollBottoms[MAX_SCROLL_MESSAGES][SCROLLER_BOTTOM_MAX_LEN + 1];
   uint8_t scrollMsgCount = 1;
   IdleStep idlePlaylist[MAX_IDLE_PLAYLIST];
   uint8_t idlePlLen = 0;
@@ -60,6 +62,7 @@ namespace {
   void clearMessages() {
     for (uint8_t i = 0; i < MAX_SCROLL_MESSAGES; i++) {
       scrollMessages[i][0] = '\0';
+      scrollBottoms[i][0] = '\0';
     }
     scrollMsgCount = 1;
   }
@@ -75,7 +78,8 @@ namespace {
     displaysBlanked = false;
     blankBrightPct = 0;
     linkedMac[0] = '\0';
-    idleEff = ShowMode::LEFT;
+    idleEffIn = ShowMode::LEFT;
+    idleEffOut = ShowMode::LEFT;
     localIncEff = ShowMode::UP;
     localDecEff = ShowMode::DOWN;
     idleCycleSec = 5;
@@ -115,7 +119,8 @@ void load() {
     linkedMac[0] = '\0';
   }
 
-  idleEff = clampEffect(prefs.getUChar("idleEff", ShowMode::LEFT));
+  idleEffIn = clampEffect(prefs.getUChar("idleEff", ShowMode::LEFT));
+  idleEffOut = clampEffect(prefs.getUChar("idleEffO", idleEffIn));
   localIncEff = clampEffect(prefs.getUChar("locIncEff", ShowMode::UP));
   localDecEff = clampEffect(prefs.getUChar("locDecEff", ShowMode::DOWN));
   idleCycleSec = clampCycleSec(prefs.getUChar("idleSec", 5));
@@ -133,6 +138,12 @@ void load() {
       if (sm.length() > 0 && sm.length() <= SCROLLER_MAX_LEN) {
         strncpy(scrollMessages[i], sm.c_str(), SCROLLER_MAX_LEN);
         scrollMessages[i][SCROLLER_MAX_LEN] = '\0';
+      }
+      snprintf(key, sizeof(key), "mb%u", i);
+      String bm = prefs.getString(key, "");
+      if (bm.length() > 0 && bm.length() <= SCROLLER_BOTTOM_MAX_LEN) {
+        strncpy(scrollBottoms[i], bm.c_str(), SCROLLER_BOTTOM_MAX_LEN);
+        scrollBottoms[i][SCROLLER_BOTTOM_MAX_LEN] = '\0';
       }
     }
   } else {
@@ -157,12 +168,16 @@ void load() {
       IdleStep step;
       step.kind = static_cast<uint8_t>((packed >> 8) & 0xFF);
       step.index = static_cast<uint8_t>(packed & 0xFF);
-      char ek[8];
+      char ek[8], ok[8];
       snprintf(ek, sizeof(ek), "pe%u", i);
-      step.effect = clampEffect(prefs.getUChar(ek, idleEff));
+      snprintf(ok, sizeof(ok), "po%u", i);
+      step.effectIn = clampEffect(prefs.getUChar(ek, idleEffIn));
+      step.effectOut = clampEffect(prefs.getUChar(ok, idleEffOut));
       if (step.kind > IdleMessage) continue;
-      if (step.kind == IdleCounter && step.index >= MAX_COUNTERS) continue;
-      if (step.kind == IdleMessage && step.index >= MAX_SCROLL_MESSAGES) continue;
+      if (step.index != IdleAutoIndex) {
+        if (step.kind == IdleCounter && step.index >= MAX_COUNTERS) continue;
+        if (step.kind == IdleMessage && step.index >= MAX_SCROLL_MESSAGES) continue;
+      }
       idlePlaylist[idlePlLen++] = step;
     }
   }
@@ -198,7 +213,8 @@ void save() {
   prefs.putUChar("blankPct", blankBrightPct);
   prefs.putUChar("active", activeIdx);
   prefs.putString("linkmac", linkedMac);
-  prefs.putUChar("idleEff", idleEff);
+  prefs.putUChar("idleEff", idleEffIn);
+  prefs.putUChar("idleEffO", idleEffOut);
   prefs.putUChar("locIncEff", localIncEff);
   prefs.putUChar("locDecEff", localDecEff);
   prefs.putUChar("idleSec", idleCycleSec);
@@ -209,10 +225,14 @@ void save() {
   for (uint8_t i = 0; i < MAX_SCROLL_MESSAGES; i++) {
     char key[8];
     snprintf(key, sizeof(key), "msg%u", i);
+    char bk[8];
+    snprintf(bk, sizeof(bk), "mb%u", i);
     if (i < scrollMsgCount) {
       prefs.putString(key, scrollMessages[i]);
+      prefs.putString(bk, scrollBottoms[i]);
     } else {
       prefs.remove(key);
+      prefs.remove(bk);
     }
   }
   // Keep legacy key in sync for older tooling
@@ -222,15 +242,18 @@ void save() {
   for (uint8_t i = 0; i < MAX_IDLE_PLAYLIST; i++) {
     char key[8];
     snprintf(key, sizeof(key), "pl%u", i);
-    char ek[8];
+    char ek[8], ok[8];
     snprintf(ek, sizeof(ek), "pe%u", i);
+    snprintf(ok, sizeof(ok), "po%u", i);
     if (i < idlePlLen) {
       uint16_t packed = static_cast<uint16_t>((idlePlaylist[i].kind << 8) | idlePlaylist[i].index);
       prefs.putUShort(key, packed);
-      prefs.putUChar(ek, idlePlaylist[i].effect);
+      prefs.putUChar(ek, idlePlaylist[i].effectIn);
+      prefs.putUChar(ok, idlePlaylist[i].effectOut);
     } else {
       prefs.remove(key);
       prefs.remove(ek);
+      prefs.remove(ok);
     }
   }
 
@@ -381,10 +404,24 @@ void clearLinkedRemoteMac() {
   markDirty();
 }
 
-uint8_t idleEffect() { return idleEff; }
+uint8_t idleEffectIn() { return idleEffIn; }
+
+void setIdleEffectIn(uint8_t effect) {
+  idleEffIn = clampEffect(effect);
+  markDirty();
+}
+
+uint8_t idleEffectOut() { return idleEffOut; }
+
+void setIdleEffectOut(uint8_t effect) {
+  idleEffOut = clampEffect(effect);
+  markDirty();
+}
+
+uint8_t idleEffect() { return idleEffIn; }
 
 void setIdleEffect(uint8_t effect) {
-  idleEff = clampEffect(effect);
+  idleEffIn = clampEffect(effect);
   markDirty();
 }
 
@@ -437,6 +474,11 @@ const char* scrollMessage(uint8_t index) {
   return scrollMessages[index];
 }
 
+const char* scrollMessageBottom(uint8_t index) {
+  if (index >= scrollMsgCount) return "";
+  return scrollBottoms[index];
+}
+
 uint8_t scrollMessageCount() { return scrollMsgCount; }
 
 void setScrollMessage(const char* text) {
@@ -450,17 +492,21 @@ void setScrollMessage(const char* text) {
   markDirty();
 }
 
-void setScrollMessages(const char* const* texts, uint8_t count) {
+void setScrollMessages(const char* const* tops, const char* const* bottoms, uint8_t count) {
   clearMessages();
   scrollMsgCount = clampMsgCount(count);
-  if (!texts) {
+  if (!tops) {
     markDirty();
     return;
   }
   for (uint8_t i = 0; i < scrollMsgCount; i++) {
-    if (texts[i]) {
-      strncpy(scrollMessages[i], texts[i], SCROLLER_MAX_LEN);
+    if (tops[i]) {
+      strncpy(scrollMessages[i], tops[i], SCROLLER_MAX_LEN);
       scrollMessages[i][SCROLLER_MAX_LEN] = '\0';
+    }
+    if (bottoms && bottoms[i]) {
+      strncpy(scrollBottoms[i], bottoms[i], SCROLLER_BOTTOM_MAX_LEN);
+      scrollBottoms[i][SCROLLER_BOTTOM_MAX_LEN] = '\0';
     }
   }
   markDirty();
@@ -470,7 +516,7 @@ uint8_t idlePlaylistLen() { return idlePlLen; }
 
 IdleStep idleStep(uint8_t index) {
   if (index >= idlePlLen) {
-    IdleStep empty = {IdleCounter, 0, ShowMode::LEFT};
+    IdleStep empty = {IdleCounter, IdleAutoIndex, ShowMode::LEFT, ShowMode::LEFT};
     return empty;
   }
   return idlePlaylist[index];
@@ -486,9 +532,12 @@ void setIdlePlaylist(const IdleStep* steps, uint8_t count) {
   for (uint8_t i = 0; i < count; i++) {
     IdleStep step = steps[i];
     if (step.kind > IdleMessage) continue;
-    if (step.kind == IdleCounter && step.index >= MAX_COUNTERS) continue;
-    if (step.kind == IdleMessage && step.index >= MAX_SCROLL_MESSAGES) continue;
-    step.effect = clampEffect(step.effect);
+    if (step.index != IdleAutoIndex) {
+      if (step.kind == IdleCounter && step.index >= MAX_COUNTERS) continue;
+      if (step.kind == IdleMessage && step.index >= MAX_SCROLL_MESSAGES) continue;
+    }
+    step.effectIn = clampEffect(step.effectIn);
+    step.effectOut = clampEffect(step.effectOut);
     idlePlaylist[idlePlLen++] = step;
   }
   markDirty();

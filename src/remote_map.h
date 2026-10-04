@@ -17,14 +17,12 @@ namespace RemoteMap {
     uint8_t buttonId;
     uint8_t action;
     uint8_t param;
-    uint8_t action2;  // double-tap
-    uint8_t param2;
-    uint8_t effect;   // ShowMode for single-tap
-    uint8_t effect2;  // ShowMode for double-tap
+    uint8_t effectIn;   // ShowMode for enter / action play
+    uint8_t effectOut;  // ShowMode for exit transition
   };
 
   void begin();
-  void loop();  // resolve pending single-taps
+  void loop();  // no-op (kept for call sites)
   void load();
   void save();
   void factoryDefaults();
@@ -34,8 +32,7 @@ namespace RemoteMap {
   uint8_t bindingCount();
   Binding getBinding(uint8_t index);
   bool setBinding(uint8_t buttonId, uint8_t action, uint8_t param,
-                  uint8_t action2, uint8_t param2,
-                  uint8_t effect, uint8_t effect2);
+                  uint8_t effectIn, uint8_t effectOut);
 
   const uint8_t* knownButtons(uint8_t& count);
   const char* buttonLabel(uint8_t buttonId);

@@ -108,7 +108,10 @@ namespace {
       case ShowMode::ANIMATION: return PA_RANDOM;
       case ShowMode::PILING: return PA_GROW_UP;
       case ShowMode::SPLITE: return PA_OPENING;
-      case ShowMode::LASER: return PA_WIPE_CURSOR;
+      case ShowMode::LASER_LEFT: return PA_WIPE_CURSOR;
+      case ShowMode::LASER_RIGHT: return PA_SLICE;
+      case ShowMode::LASER_UP: return PA_SCAN_VERT;
+      case ShowMode::LASER_DOWN: return PA_SCAN_VERTX;
       case ShowMode::SMOTH: return PA_FADE;
       case ShowMode::ROTATE: return PA_MESH;
       default: return PA_SCROLL_LEFT;
@@ -193,11 +196,20 @@ namespace {
   bool nameStaticValid = false;
   int16_t nameStaticOrigin = 0;
 
-  // Manual marquee (name zone loops; number cleared)
+  // Manual marquee / static message screen (name + optional bottom)
   bool scrollerOn = false;
+  bool scrollerPassDone = false;
+  bool scrollerTopScrolls = false;
+  bool scrollerBottomScrolls = false;
+  bool scrollerTopPassLatched = false;  // finished one pass (don't restart)
+  bool scrollerBotPassLatched = false;
   uint8_t scrollerZone = 0;
+  uint8_t scrollerBottomZone = 0;
+  bool scrollerHasBottom = false;
   char scrollerBuf[SCROLLER_MAX_LEN + 1] = "";
+  char scrollerBottomBuf[SCROLLER_BOTTOM_MAX_LEN + 1] = "";
   textEffect_t scrollerDir = PA_SCROLL_LEFT;
+  textEffect_t scrollerBottomDir = PA_SCROLL_LEFT;
 
   void setNameModulesIntensity(uint8_t intensity) {
     MD_MAX72XX* mx = board->getGraphicObject();
@@ -306,48 +318,13 @@ namespace {
     if (doUpdate) mx->update();
   }
 
-  // Scroll whatever is currently displayed off-panel (used by manual scroller start).
-  bool scrollDisplayedOff(bool slideLeft, uint32_t nameGen, uint32_t numGen) {
+  // Exit with the same Parola effect used for enter (toParolaEffect).
+  // resolved = already resolveEffect()'d.
+  bool scrollDisplayedOff(uint8_t resolved, uint32_t nameGen, uint32_t numGen,
+                          bool fromScroller) {
     const int8_t nz = nameZoneId();
     const int8_t cz = numberZone();
     if (nz < 0 && cz < 0) return true;
-
-    uint16_t nStart = 0, nEnd = 0, zStart = 0, zEnd = 0;
-    uint16_t zCols = 0, nCols = 0;
-    uint8_t nameSnap[MODULES_NAME * COLS_PER_MOD];
-    uint8_t numSnap[MODULES_NUMBER * COLS_PER_MOD];
-
-    if (nz >= 0) {
-      board->getDisplayExtent(static_cast<uint8_t>(nz), zStart, zEnd);
-      zCols = zoneWidthCols(static_cast<uint8_t>(nz));
-      if (zCols > sizeof(nameSnap)) zCols = sizeof(nameSnap);
-      snapshotZone(zStart, zCols, nameSnap, NAME_ZONE_FLIP_LR);
-    }
-    if (cz >= 0) {
-      board->getDisplayExtent(static_cast<uint8_t>(cz), nStart, nEnd);
-      nCols = zoneWidthCols(static_cast<uint8_t>(cz));
-      if (nCols > sizeof(numSnap)) nCols = sizeof(numSnap);
-      snapshotZone(nStart, nCols, numSnap, false);
-    }
-
-    const int16_t nameFrom = 0;
-    const int16_t nameTo =
-        slideLeft ? static_cast<int16_t>(zCols) : static_cast<int16_t>(-static_cast<int16_t>(zCols));
-    const int16_t numFrom = 0;
-    const int16_t numTo =
-        slideLeft ? static_cast<int16_t>(nCols) : static_cast<int16_t>(-static_cast<int16_t>(nCols));
-
-    const uint16_t nameDist =
-        (nz >= 0) ? static_cast<uint16_t>(nameFrom > nameTo ? (nameFrom - nameTo) : (nameTo - nameFrom))
-                  : 0;
-    const uint16_t numDist =
-        (cz >= 0) ? static_cast<uint16_t>(numFrom > numTo ? (numFrom - numTo) : (numTo - numFrom))
-                  : 0;
-    uint16_t frames = nameDist > numDist ? nameDist : numDist;
-    if (frames == 0) return true;
-
-    const uint16_t frameMs = transitionFrameMs();
-    const uint8_t stride = transitionStride();
 
     auto stillOk = [&]() -> bool {
       if (nz >= 0 && !animCurrent(AnimSlot::Name, nameGen)) return false;
@@ -355,31 +332,51 @@ namespace {
       return true;
     };
 
-    auto lerpOrigin = [](int16_t a, int16_t b, uint16_t i, uint16_t n) -> int16_t {
-      if (n == 0) return b;
-      return static_cast<int16_t>(
-          a + (static_cast<int32_t>(b - a) * static_cast<int32_t>(i)) / static_cast<int32_t>(n));
-    };
-
-    for (uint16_t i = 0; i < frames; ) {
+    if (resolved == ShowMode::FREEZE || fromScroller) {
+      // FREEZE: instant clear.
+      // Scroller: never PA_PRINT the message — that flashes it back after scroll-off.
       if (!stillOk()) return false;
-      uint16_t next = static_cast<uint16_t>(i + stride);
-      if (next > frames) next = frames;
-      i = next;
-      const int16_t oName = (nz >= 0) ? lerpOrigin(nameFrom, nameTo, i, frames) : 0;
-      const int16_t oNum = (cz >= 0) ? lerpOrigin(numFrom, numTo, i, frames) : 0;
-      if (nz >= 0) {
-        blitZonePush(zStart, zCols, nameSnap, zCols, oName, nullptr, 0, 0,
-                     NAME_ZONE_FLIP_LR, false, cz < 0);
-      }
-      if (cz >= 0) {
-        blitZonePush(nStart, nCols, numSnap, nCols, oNum, nullptr, 0, 0, false, false, true);
-      }
-      const uint32_t t0 = millis();
-      while (static_cast<uint32_t>(millis() - t0) < frameMs) {
-        if (!stillOk()) return false;
-        pollDuringAnim();
-      }
+      board->displayClear();
+      return stillOk();
+    }
+
+    // Scoreboard: text currently on screen (Parola out needs the string).
+    char top[SCROLLER_MAX_LEN + 1];
+    char bot[SCROLLER_BOTTOM_MAX_LEN + 1];
+    {
+      const Counter& c = Counters::getConst(Counters::activeIndex());
+      strncpy(top, c.name, sizeof(top) - 1);
+      top[sizeof(top) - 1] = '\0';
+      formatCount(c.count);
+      strncpy(bot, numBuf, sizeof(bot) - 1);
+      bot[sizeof(bot) - 1] = '\0';
+    }
+    if (!top[0]) strncpy(top, " ", sizeof(top));
+    if (!bot[0]) strncpy(bot, " ", sizeof(bot));
+
+    const textEffect_t outEff = toParolaEffect(resolved);
+    uint16_t spd = parolaScrollSpeed(40);
+    if (resolved == ShowMode::ANIMATION) spd = 6;
+
+    // Instant print then out-effect — same Parola engine / mapping as enter.
+    if (nz >= 0) {
+      board->setCharSpacing(static_cast<uint8_t>(nz), 1);
+      board->displayZoneText(static_cast<uint8_t>(nz), top, PA_CENTER, spd, 0, PA_PRINT,
+                             outEff);
+      board->displayReset(static_cast<uint8_t>(nz));
+    }
+    if (cz >= 0) {
+      board->setCharSpacing(static_cast<uint8_t>(cz), 1);
+      board->displayZoneText(static_cast<uint8_t>(cz), bot, PA_CENTER, spd, 0, PA_PRINT,
+                             outEff);
+      board->displayReset(static_cast<uint8_t>(cz));
+    }
+
+    while ((nz >= 0 && !board->getZoneStatus(static_cast<uint8_t>(nz))) ||
+           (cz >= 0 && !board->getZoneStatus(static_cast<uint8_t>(cz)))) {
+      if (!stillOk()) return false;
+      board->displayAnimate();
+      pollDuringAnim();
     }
     return stillOk();
   }
@@ -629,31 +626,49 @@ namespace {
       return stillOk();
     };
 
+    auto paintNumberParola = [&]() -> bool {
+      if (!dual || !numText) return true;
+      board->setCharSpacing(numZone, 1);
+      board->displayClear(numZone);
+      board->displayZoneText(numZone, numText, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+      board->displayReset(numZone);
+      while (!board->getZoneStatus(numZone)) {
+        if (!stillOk()) return false;
+        board->displayAnimate();
+        // Parola may touch the name zone — keep the faded/static name pixels.
+        blitNameWindow(z, startCol, zCols, teeter.colBuf, tCols,
+                       nameStaticValid ? nameStaticOrigin : 0);
+        pollDuringAnim();
+      }
+      return stillOk();
+    };
+
     auto fadeNameWithNumber = [&](int16_t nameOrigin) -> bool {
       const uint8_t target = effectiveIntensity();
       const uint16_t frameMs = static_cast<uint16_t>(transitionFrameMs() + 4);
+
+      // Number uses the same Parola PA_PRINT path as paintContent — custom column
+      // blit centered differently and jumped ~1px when loop() called displayAnimate.
+      nameStaticValid = false;
+      if (dual) {
+        board->setCharSpacing(numZone, 1);
+        board->displayClear(numZone);
+        board->displayZoneText(numZone, numText, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+        board->displayReset(numZone);
+        while (!board->getZoneStatus(numZone)) {
+          if (!stillOk()) return false;
+          board->displayAnimate();
+          pollDuringAnim();
+        }
+      }
+
       setNameModulesIntensity(0);
       blitNameWindow(z, startCol, zCols, teeter.colBuf, tCols, nameOrigin);
-
-      // Number appears settled immediately — no Parola during name fade.
-      if (dual) {
-        constexpr uint16_t NUM_COL_BUF = 64;
-        uint8_t numColBuf[NUM_COL_BUF];
-        uint16_t nStart = 0, nEnd = 0;
-        board->getDisplayExtent(static_cast<uint8_t>(numZone), nStart, nEnd);
-        const uint16_t nZoneCols = zoneWidthCols(static_cast<uint8_t>(numZone));
-        const uint16_t nTextCols = buildNameColumns(numText, numColBuf, NUM_COL_BUF);
-        const int16_t nOrigin =
-            (nTextCols >= nZoneCols)
-                ? 0
-                : static_cast<int16_t>(
-                      -((static_cast<int16_t>(nZoneCols) - static_cast<int16_t>(nTextCols)) / 2));
-        blitZoneColumns(nStart, nZoneCols, numColBuf, nTextCols, nOrigin, false, false, true);
-      }
 
       for (uint8_t level = 0; level <= target; level++) {
         if (!stillOk()) return false;
         setNameModulesIntensity(level);
+        // Keep name pixels; do not call displayAnimate (would fight the blit).
         const uint32_t t0 = millis();
         while (static_cast<uint32_t>(millis() - t0) < frameMs) {
           if (!stillOk()) return false;
@@ -662,6 +677,13 @@ namespace {
       }
       board->setIntensity(effectiveIntensity());
       blitNameWindow(z, startCol, zCols, teeter.colBuf, tCols, nameOrigin);
+      nameStaticValid = true;
+      nameStaticOrigin = nameOrigin;
+      // Re-settle number so Parola's zone state matches what's on screen.
+      if (dual) {
+        if (!paintNumberParola()) return false;
+        blitNameWindow(z, startCol, zCols, teeter.colBuf, tCols, nameOrigin);
+      }
       return stillOk();
     };
 
@@ -694,27 +716,14 @@ namespace {
     };
 
     auto paintNumberStatic = [&]() -> bool {
-      if (!dual) return true;
-      constexpr uint16_t NUM_COL_BUF = 64;
-      uint8_t numColBuf[NUM_COL_BUF];
-      uint16_t nStart = 0, nEnd = 0;
-      board->getDisplayExtent(static_cast<uint8_t>(numZone), nStart, nEnd);
-      const uint16_t nZoneCols = zoneWidthCols(static_cast<uint8_t>(numZone));
-      const uint16_t nTextCols = buildNameColumns(numText, numColBuf, NUM_COL_BUF);
-      const int16_t nOrigin =
-          (nTextCols >= nZoneCols)
-              ? 0
-              : static_cast<int16_t>(
-                    -((static_cast<int16_t>(nZoneCols) - static_cast<int16_t>(nTextCols)) / 2));
-      blitZoneColumns(nStart, nZoneCols, numColBuf, nTextCols, nOrigin, false, false, true);
-      return stillOk();
+      // Match paintContent / fade — Parola center, not custom column blit.
+      return paintNumberParola();
     };
 
     // Oversized names: transition into teeter start (offset 0), then bounce.
     if (tCols > zCols) {
       if (resolved == ShowMode::SMOTH) {
         if (!fadeNameWithNumber(0)) return false;
-        if (!finishDual(0)) return false;
         startNameTeeter(z, text);
         return stillOk();
       }
@@ -730,6 +739,7 @@ namespace {
         startNameTeeter(z, text);
         return stillOk();
       }
+      if (!scrollDisplayedOff(resolved, gen, dual ? numGen : gen, false)) return false;
       if (!runDualParola()) return false;
       startNameTeeter(z, text);
       return stillOk();
@@ -747,10 +757,12 @@ namespace {
     if (resolved == ShowMode::SMOTH) {
       board->displayClear(z);
       if (!fadeNameWithNumber(finalOrigin)) return false;
-      return finishDual(finalOrigin);
+      return stillOk();
     }
 
     if (resolved != ShowMode::LEFT && resolved != ShowMode::RIGHT) {
+      // Exit old content with the same effect before Parola enter.
+      if (!scrollDisplayedOff(resolved, gen, dual ? numGen : gen, false)) return false;
       return runDualParola();
     }
 
@@ -1137,9 +1149,23 @@ void loop() {
   if (!displayVisible()) return;
 
   if (scrollerOn) {
-    board->displayAnimate();
-    if (board->getZoneStatus(scrollerZone)) {
-      board->displayReset(scrollerZone);
+    if (scrollerTopScrolls || scrollerBottomScrolls) {
+      board->displayAnimate();
+      // Latch each line's first completed pass; clear it (don't reset — that
+      // jumped the text back on-screen). Advance when the longest is done.
+      if (scrollerTopScrolls && !scrollerTopPassLatched &&
+          board->getZoneStatus(scrollerZone)) {
+        scrollerTopPassLatched = true;
+        board->displayClear(scrollerZone);
+      }
+      if (scrollerBottomScrolls && scrollerHasBottom && !scrollerBotPassLatched &&
+          board->getZoneStatus(scrollerBottomZone)) {
+        scrollerBotPassLatched = true;
+        board->displayClear(scrollerBottomZone);
+      }
+      scrollerPassDone = scrollerTopPassLatched && scrollerBotPassLatched;
+    } else {
+      scrollerPassDone = true;
     }
     return;
   }
@@ -1215,10 +1241,11 @@ void onCountDecreased(int32_t newCount, uint8_t effect) {
 }
 
 void idleShowNext(int32_t /*count*/, uint8_t effect) {
-  // If marquee was running, kill it hard so the enter transition owns the panel.
-  if (scrollerOn) {
-    haltScrollerEngine();
-  }
+  // Soft-stop marquee flag; preferred path animates off before calling this.
+  scrollerOn = false;
+  scrollerPassDone = false;
+  scrollerTopScrolls = false;
+  scrollerBottomScrolls = false;
   if (!inited || !board || !displayVisible()) {
     applyBlankState();
     return;
@@ -1238,9 +1265,15 @@ void selectShow(uint8_t effect) {
 
 bool scrollerActive() { return scrollerOn; }
 
+bool scrollerCompletedPass() { return scrollerPassDone; }
+
 // Halt marquee and leave Parola zones idle so loop() won't keep scrolling.
 void haltScrollerEngine() {
   scrollerOn = false;
+  scrollerPassDone = false;
+  scrollerTopScrolls = false;
+  scrollerBottomScrolls = false;
+  scrollerHasBottom = false;
   stopNameTeeter();
   nameStaticValid = false;
   beginAnim(AnimSlot::Name);
@@ -1267,23 +1300,56 @@ void haltScrollerEngine() {
 }
 
 void stopManualScroller(bool restore) {
-  if (!scrollerOn) return;
+  if (!scrollerOn && !restore) {
+    // Still allow a clear settle when idle asks to drop the panel.
+  }
   haltScrollerEngine();
   if (!inited || !board) return;
   if (restore) applyBlankState();
 }
 
-void startManualScroller(uint8_t effect, const char* text) {
+bool animateDisplayedOff(uint8_t effect) {
+  if (!inited || !board) return false;
+  const bool fromScroller = scrollerOn;
+  // Stop marquee engine; scroller exit must not reprint text.
+  scrollerOn = false;
+  scrollerPassDone = false;
+  scrollerTopScrolls = false;
+  scrollerBottomScrolls = false;
+  stopNameTeeter();
+  nameStaticValid = false;
+  const uint32_t nameGen = beginAnim(AnimSlot::Name);
+  const uint32_t numGen = beginAnim(AnimSlot::Num);
+  const uint8_t resolved = resolveEffect(effect);
+  if (!scrollDisplayedOff(resolved, nameGen, numGen, fromScroller)) return false;
+  board->displayClear();
+  return true;
+}
+
+void startManualScroller(uint8_t effectIn, const char* text, const char* bottom,
+                         uint8_t effectOut) {
   if (!inited || !board) return;
   if (!displayVisible()) {
     applyBlankState();
     return;
   }
 
+  const bool fromScroller = scrollerOn;
+  // Keep current content for exit; only stop the marquee flag so loop won't fight us.
+  scrollerOn = false;
+  scrollerTopScrolls = false;
+  scrollerBottomScrolls = false;
   stopNameTeeter();
   nameStaticValid = false;
   const uint32_t nameGen = beginAnim(AnimSlot::Name);
   const uint32_t numGen = beginAnim(AnimSlot::Num);
+
+  const uint8_t resolvedOut = resolveEffect(effectOut);
+
+  // Exit previous content (scroller never reprints — that flashed text after scroll-off).
+  if (!scrollDisplayedOff(resolvedOut, nameGen, numGen, fromScroller)) {
+    return;
+  }
 
   const char* msg = text ? text : Counters::scrollMessage();
   if (msg && msg[0]) {
@@ -1293,35 +1359,77 @@ void startManualScroller(uint8_t effect, const char* text) {
     strncpy(scrollerBuf, " ", sizeof(scrollerBuf));
   }
 
-  const uint8_t resolved = resolveEffect(effect);
-  scrollerDir = (resolved == ShowMode::RIGHT) ? PA_SCROLL_RIGHT : PA_SCROLL_LEFT;
-  const bool slideLeft = (scrollerDir == PA_SCROLL_LEFT);
-
-  // Scroll current scoreboard off before the marquee owns the panel.
-  if (!scrollDisplayedOff(slideLeft, nameGen, numGen)) {
-    // Cancelled — leave whatever is mid-frame; pending anim will take over.
-    return;
+  const char* bot = bottom;
+  if (!bot && !text) bot = Counters::scrollMessageBottom(0);
+  if (bot && bot[0]) {
+    strncpy(scrollerBottomBuf, bot, SCROLLER_BOTTOM_MAX_LEN);
+    scrollerBottomBuf[SCROLLER_BOTTOM_MAX_LEN] = '\0';
+  } else {
+    scrollerBottomBuf[0] = '\0';
   }
+
+  const uint8_t resolvedIn = resolveEffect(effectIn);
+  const bool wantLeft = (resolvedIn != ShowMode::RIGHT);
+  // Name zone is LR-flipped; number zone is not — use matching visual directions.
+  bool nameParolaRight = !wantLeft;
+  if (NAME_ZONE_FLIP_LR) nameParolaRight = !nameParolaRight;
+  scrollerDir = nameParolaRight ? PA_SCROLL_RIGHT : PA_SCROLL_LEFT;
+  scrollerBottomDir = wantLeft ? PA_SCROLL_LEFT : PA_SCROLL_RIGHT;
 
   const int8_t nz = nameZoneId();
   const int8_t cz = numberZone();
   if (nz < 0) return;
 
   scrollerZone = static_cast<uint8_t>(nz);
+  scrollerHasBottom = (cz >= 0 && scrollerBottomBuf[0]);
+  scrollerBottomZone = scrollerHasBottom ? static_cast<uint8_t>(cz) : 0;
+
+  // Scroll only when text does not fit the zone width.
+  uint8_t fitBuf[NAME_COL_BUF];
+  const uint16_t topCols = buildNameColumns(scrollerBuf, fitBuf, NAME_COL_BUF);
+  const uint16_t topZoneCols = zoneWidthCols(scrollerZone);
+  scrollerTopScrolls = (topCols > topZoneCols);
+
+  scrollerBottomScrolls = false;
+  if (scrollerHasBottom) {
+    uint8_t botFit[64];
+    const uint16_t botCols = buildNameColumns(scrollerBottomBuf, botFit, sizeof(botFit));
+    const uint16_t botZoneCols = zoneWidthCols(scrollerBottomZone);
+    scrollerBottomScrolls = (botCols > botZoneCols);
+  }
+
   scrollerOn = true;
+  scrollerTopPassLatched = !scrollerTopScrolls;  // static = already "done"
+  scrollerBotPassLatched = !scrollerBottomScrolls;
+  scrollerPassDone = scrollerTopPassLatched && scrollerBotPassLatched;
 
   board->displayShutdown(false);
   board->setIntensity(effectiveIntensity());
   board->displayClear();
 
-  if (cz >= 0) {
-    board->displayClear(cz);
-  }
-
   const uint16_t spd = parolaScrollSpeed(40);
   board->setCharSpacing(scrollerZone, 1);
-  board->displayZoneText(scrollerZone, scrollerBuf, PA_LEFT, spd, 0, scrollerDir, scrollerDir);
+  if (scrollerTopScrolls) {
+    board->displayZoneText(scrollerZone, scrollerBuf, PA_LEFT, spd, 0, scrollerDir, scrollerDir);
+  } else {
+    board->displayZoneText(scrollerZone, scrollerBuf, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+  }
   board->displayReset(scrollerZone);
+
+  if (cz >= 0) {
+    board->displayClear(cz);
+    if (scrollerHasBottom) {
+      board->setCharSpacing(scrollerBottomZone, 1);
+      if (scrollerBottomScrolls) {
+        board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_LEFT, spd, 0,
+                               scrollerBottomDir, scrollerBottomDir);
+      } else {
+        board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_CENTER, 0, 0,
+                               PA_PRINT, PA_NO_EFFECT);
+      }
+      board->displayReset(scrollerBottomZone);
+    }
+  }
 }
 
 }  // namespace Display

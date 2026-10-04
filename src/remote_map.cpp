@@ -29,10 +29,6 @@ namespace {
 
   RemoteMap::Binding bindings[KNOWN_COUNT];
 
-  int16_t pendingBtn = -1;
-  uint32_t pendingMs = 0;
-  bool pendingArmed = false;
-
   int findIndex(uint8_t buttonId) {
     for (uint8_t i = 0; i < KNOWN_COUNT; i++) {
       if (bindings[i].buttonId == buttonId) return i;
@@ -45,17 +41,13 @@ namespace {
   }
 
   void setDefault(uint8_t id, uint8_t act, uint8_t param,
-                  uint8_t effect,
-                  uint8_t act2 = RemoteMap::ACTION_NONE, uint8_t param2 = 0,
-                  uint8_t effect2 = ShowMode::LEFT) {
+                  uint8_t effectIn, uint8_t effectOut = ShowMode::LEFT) {
     for (uint8_t i = 0; i < KNOWN_COUNT; i++) {
       if (bindings[i].buttonId == id) {
         bindings[i].action = act;
         bindings[i].param = param;
-        bindings[i].action2 = act2;
-        bindings[i].param2 = param2;
-        bindings[i].effect = effect;
-        bindings[i].effect2 = effect2;
+        bindings[i].effectIn = effectIn;
+        bindings[i].effectOut = effectOut;
         return;
       }
     }
@@ -66,29 +58,28 @@ namespace {
       bindings[i].buttonId = KNOWN_BUTTONS[i];
       bindings[i].action = RemoteMap::ACTION_NONE;
       bindings[i].param = 0;
-      bindings[i].action2 = RemoteMap::ACTION_NONE;
-      bindings[i].param2 = 0;
-      bindings[i].effect = ShowMode::LEFT;
-      bindings[i].effect2 = ShowMode::LEFT;
+      bindings[i].effectIn = ShowMode::LEFT;
+      bindings[i].effectOut = ShowMode::LEFT;
     }
 
-    setDefault(WIZ_ONE, RemoteMap::ACTION_SELECT, 0, ShowMode::LEFT);
-    setDefault(WIZ_TWO, RemoteMap::ACTION_SELECT, 1, ShowMode::LEFT);
-    setDefault(WIZ_THREE, RemoteMap::ACTION_SELECT, 2, ShowMode::LEFT);
-    setDefault(WIZ_FOUR, RemoteMap::ACTION_SELECT, 3, ShowMode::LEFT);
-    setDefault(WIZ_BRIGHT_UP, RemoteMap::ACTION_INC_ACTIVE, 0, ShowMode::UP);
-    setDefault(WIZ_BRIGHT_DOWN, RemoteMap::ACTION_DEC_ACTIVE, 0, ShowMode::DOWN);
-    setDefault(WIZ_ON, RemoteMap::ACTION_UNBLANK, 0, ShowMode::FREEZE);
-    setDefault(WIZ_OFF, RemoteMap::ACTION_BLANK, 0, ShowMode::FREEZE);
-    setDefault(WIZ_NIGHT, RemoteMap::ACTION_NONE, 0, ShowMode::FREEZE);
+    setDefault(WIZ_ONE, RemoteMap::ACTION_SELECT, 0, ShowMode::LEFT, ShowMode::LEFT);
+    setDefault(WIZ_TWO, RemoteMap::ACTION_SELECT, 1, ShowMode::LEFT, ShowMode::LEFT);
+    setDefault(WIZ_THREE, RemoteMap::ACTION_SELECT, 2, ShowMode::LEFT, ShowMode::LEFT);
+    setDefault(WIZ_FOUR, RemoteMap::ACTION_SELECT, 3, ShowMode::LEFT, ShowMode::LEFT);
+    setDefault(WIZ_BRIGHT_UP, RemoteMap::ACTION_INC_ACTIVE, 0, ShowMode::UP, ShowMode::LEFT);
+    setDefault(WIZ_BRIGHT_DOWN, RemoteMap::ACTION_DEC_ACTIVE, 0, ShowMode::DOWN, ShowMode::LEFT);
+    setDefault(WIZ_ON, RemoteMap::ACTION_UNBLANK, 0, ShowMode::FREEZE, ShowMode::FREEZE);
+    setDefault(WIZ_OFF, RemoteMap::ACTION_BLANK, 0, ShowMode::FREEZE, ShowMode::FREEZE);
+    setDefault(WIZ_NIGHT, RemoteMap::ACTION_NONE, 0, ShowMode::FREEZE, ShowMode::FREEZE);
   }
 
-  void execute(uint8_t action, uint8_t param, uint8_t effect) {
-    const uint8_t eff = clampEffect(effect);
+  void execute(uint8_t action, uint8_t param, uint8_t effectIn, uint8_t effectOut) {
+    const uint8_t inEff = clampEffect(effectIn);
+    const uint8_t outEff = clampEffect(effectOut);
 
     if (action != RemoteMap::ACTION_SCROLLER && Display::scrollerActive()) {
-      // Select: halt marquee (blank slate); selectShow plays the key's enter transition.
-      // Other actions restore the scoreboard immediately.
+      // Animate marquee off with this key's out, then continue the action.
+      Display::animateDisplayedOff(outEff);
       Display::stopManualScroller(action != RemoteMap::ACTION_SELECT);
     }
 
@@ -99,11 +90,10 @@ namespace {
       case RemoteMap::ACTION_SELECT:
         if (Counters::isEnabled(param)) {
           Counters::setActiveIndex(param);
-          // Enter transition for this counter (Anim on the binding).
-          Display::selectShow(eff);
+          Display::selectShow(inEff);
           Counters::saveIfDirty();
-          Serial.printf("[wiz] select counter %u (%s) anim %u\n", param + 1,
-                        Counters::getConst(param).name, eff);
+          Serial.printf("[wiz] select counter %u (%s) in %u out %u\n", param + 1,
+                        Counters::getConst(param).name, inEff, outEff);
         } else {
           Serial.printf("[wiz] select %u ignored (disabled)\n", param + 1);
         }
@@ -112,7 +102,7 @@ namespace {
       case RemoteMap::ACTION_INC_ACTIVE: {
         uint8_t a = Counters::activeIndex();
         if (Counters::inc(a)) {
-          Display::onCountIncreased(Counters::getConst(a).count, eff);
+          Display::onCountIncreased(Counters::getConst(a).count, inEff);
           Counters::saveIfDirty();
         }
         break;
@@ -121,7 +111,7 @@ namespace {
       case RemoteMap::ACTION_DEC_ACTIVE: {
         uint8_t a = Counters::activeIndex();
         if (Counters::dec(a)) {
-          Display::onCountDecreased(Counters::getConst(a).count, eff);
+          Display::onCountDecreased(Counters::getConst(a).count, inEff);
           Counters::saveIfDirty();
         }
         break;
@@ -142,10 +132,11 @@ namespace {
       case RemoteMap::ACTION_SCROLLER:
         IdleCycle::noteActivity();
         if (Display::scrollerActive()) {
+          Display::animateDisplayedOff(outEff);
           Display::stopManualScroller();
           Serial.println(F("[wiz] scroller stop"));
         } else {
-          Display::startManualScroller(eff);
+          Display::startManualScroller(inEff, nullptr, nullptr, outEff);
           Serial.println(F("[wiz] scroller start"));
         }
         break;
@@ -153,14 +144,6 @@ namespace {
       default:
         break;
     }
-  }
-
-  void flushPendingTap() {
-    if (!pendingArmed) return;
-    int idx = findIndex(static_cast<uint8_t>(pendingBtn));
-    pendingArmed = false;
-    if (idx < 0) return;
-    execute(bindings[idx].action, bindings[idx].param, bindings[idx].effect);
   }
 }
 
@@ -173,32 +156,26 @@ void factoryDefaults() {
 void begin() {
   applyDefaults();
   load();
-  pendingArmed = false;
 }
 
 void loop() {
-  if (pendingArmed && (millis() - pendingMs) >= DOUBLE_TAP_MS) {
-    flushPendingTap();
-  }
+  // Immediate taps — nothing deferred.
 }
 
 void load() {
   if (!prefs.begin("rfremote", true)) return;
 
   for (uint8_t i = 0; i < KNOWN_COUNT; i++) {
-    char keyA[8], keyP[8], keyA2[8], keyP2[8], keyE[8], keyE2[8];
+    char keyA[8], keyP[8], keyE[8], keyE2[8];
     snprintf(keyA, sizeof(keyA), "a%u", bindings[i].buttonId);
     snprintf(keyP, sizeof(keyP), "p%u", bindings[i].buttonId);
-    snprintf(keyA2, sizeof(keyA2), "A%u", bindings[i].buttonId);
-    snprintf(keyP2, sizeof(keyP2), "P%u", bindings[i].buttonId);
     snprintf(keyE, sizeof(keyE), "e%u", bindings[i].buttonId);
     snprintf(keyE2, sizeof(keyE2), "E%u", bindings[i].buttonId);
     bindings[i].action = prefs.getUChar(keyA, bindings[i].action);
     bindings[i].param = prefs.getUChar(keyP, bindings[i].param);
-    bindings[i].action2 = prefs.getUChar(keyA2, bindings[i].action2);
-    bindings[i].param2 = prefs.getUChar(keyP2, bindings[i].param2);
-    bindings[i].effect = clampEffect(prefs.getUChar(keyE, bindings[i].effect));
-    bindings[i].effect2 = clampEffect(prefs.getUChar(keyE2, bindings[i].effect2));
+    // Legacy: e = effectIn, E = effectOut (was double-tap effect)
+    bindings[i].effectIn = clampEffect(prefs.getUChar(keyE, bindings[i].effectIn));
+    bindings[i].effectOut = clampEffect(prefs.getUChar(keyE2, bindings[i].effectOut));
   }
 
   prefs.end();
@@ -217,10 +194,10 @@ void save() {
     snprintf(keyE2, sizeof(keyE2), "E%u", bindings[i].buttonId);
     prefs.putUChar(keyA, bindings[i].action);
     prefs.putUChar(keyP, bindings[i].param);
-    prefs.putUChar(keyA2, bindings[i].action2);
-    prefs.putUChar(keyP2, bindings[i].param2);
-    prefs.putUChar(keyE, bindings[i].effect);
-    prefs.putUChar(keyE2, bindings[i].effect2);
+    prefs.putUChar(keyE, bindings[i].effectIn);
+    prefs.putUChar(keyE2, bindings[i].effectOut);
+    prefs.remove(keyA2);
+    prefs.remove(keyP2);
   }
 
   prefs.end();
@@ -233,53 +210,28 @@ void handleButton(uint8_t buttonId) {
   IdleCycle::noteActivity();
 
   const Binding& b = bindings[idx];
-  const uint32_t now = millis();
-
-  if (pendingArmed && pendingBtn == static_cast<int16_t>(buttonId) &&
-      (now - pendingMs) < DOUBLE_TAP_MS) {
-    pendingArmed = false;
-    Serial.printf("[wiz] double-tap btn %u\n", buttonId);
-    execute(b.action2, b.param2, b.effect2);
-    return;
-  }
-
-  if (pendingArmed) {
-    flushPendingTap();
-  }
-
-  if (b.action2 != ACTION_NONE) {
-    pendingBtn = buttonId;
-    pendingMs = now;
-    pendingArmed = true;
-    return;
-  }
-
-  execute(b.action, b.param, b.effect);
+  execute(b.action, b.param, b.effectIn, b.effectOut);
 }
 
 uint8_t bindingCount() { return KNOWN_COUNT; }
 
 Binding getBinding(uint8_t index) {
   if (index >= KNOWN_COUNT) {
-    return Binding{0, ACTION_NONE, 0, ACTION_NONE, 0, ShowMode::LEFT, ShowMode::LEFT};
+    return Binding{0, ACTION_NONE, 0, ShowMode::LEFT, ShowMode::LEFT};
   }
   return bindings[index];
 }
 
 bool setBinding(uint8_t buttonId, uint8_t action, uint8_t param,
-                uint8_t action2, uint8_t param2,
-                uint8_t effect, uint8_t effect2) {
+                uint8_t effectIn, uint8_t effectOut) {
   int idx = findIndex(buttonId);
   if (idx < 0) return false;
-  if (action > ACTION_SCROLLER || action2 > ACTION_SCROLLER) return false;
+  if (action > ACTION_SCROLLER) return false;
   if (action == ACTION_SELECT && param >= MAX_COUNTERS) return false;
-  if (action2 == ACTION_SELECT && param2 >= MAX_COUNTERS) return false;
   bindings[idx].action = action;
   bindings[idx].param = param;
-  bindings[idx].action2 = action2;
-  bindings[idx].param2 = param2;
-  bindings[idx].effect = clampEffect(effect);
-  bindings[idx].effect2 = clampEffect(effect2);
+  bindings[idx].effectIn = clampEffect(effectIn);
+  bindings[idx].effectOut = clampEffect(effectOut);
   return true;
 }
 

@@ -45,7 +45,8 @@ static constexpr int8_t CS_PINS[MAX_COUNTERS] = {
 
 static constexpr uint8_t DEFAULT_INTENSITY = 4;
 static constexpr uint8_t DEFAULT_ENABLED_COUNT = 4;  // slots 1–4 selectable out of the box
-static constexpr uint8_t SCROLLER_MAX_LEN = 64;      // manual marquee message
+static constexpr uint8_t SCROLLER_MAX_LEN = 64;      // top marquee message
+static constexpr uint8_t SCROLLER_BOTTOM_MAX_LEN = 16; // bottom line (number zone)
 static constexpr uint8_t MAX_SCROLL_MESSAGES = 8;
 static constexpr uint8_t MAX_IDLE_PLAYLIST = 16;
 

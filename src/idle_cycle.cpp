@@ -8,7 +8,11 @@ namespace {
   uint32_t lastCycleMs = 0;
   bool cycling = false;
   bool idleOwnsScroller = false;
+  bool waitScrollerPass = false;  // hold until marquee finishes one pass (if scrolling)
   uint8_t playlistCursor = 0;  // next step to show
+  uint8_t msgCursor = 0;       // next auto message index
+  uint8_t cntCursor = 0;       // next auto counter index
+  uint8_t prevOut = 0;         // effectOut of the step currently on screen
 
   int8_t nextEnabled(uint8_t from) {
     for (uint8_t step = 1; step <= MAX_COUNTERS; step++) {
@@ -18,15 +22,40 @@ namespace {
     return -1;
   }
 
+  int8_t nextEnabledFrom(uint8_t from) {
+    for (uint8_t step = 0; step < MAX_COUNTERS; step++) {
+      uint8_t i = (from + step) % MAX_COUNTERS;
+      if (Counters::isEnabled(i)) return static_cast<int8_t>(i);
+    }
+    return -1;
+  }
+
+  int8_t nextMessageFrom(uint8_t from) {
+    const uint8_t n = Counters::scrollMessageCount();
+    if (n == 0) return -1;
+    for (uint8_t step = 0; step < n; step++) {
+      uint8_t i = (from + step) % n;
+      const char* msg = Counters::scrollMessage(i);
+      if (msg && msg[0]) return static_cast<int8_t>(i);
+    }
+    return -1;
+  }
+
   uint8_t enabledTotal() {
     return Counters::enabledCount();
   }
 
+  bool anyNonEmptyMessage() {
+    return nextMessageFrom(0) >= 0;
+  }
+
   bool stepIsValid(const IdleStep& step) {
     if (step.kind == IdleCounter) {
+      if (step.index == IdleAutoIndex) return enabledTotal() > 0;
       return Counters::isEnabled(step.index);
     }
     if (step.kind == IdleMessage) {
+      if (step.index == IdleAutoIndex) return anyNonEmptyMessage();
       if (step.index >= Counters::scrollMessageCount()) return false;
       const char* msg = Counters::scrollMessage(step.index);
       return msg && msg[0];
@@ -34,8 +63,6 @@ namespace {
     return false;
   }
 
-  // Find next valid playlist index starting at `from` (inclusive), wrapping once.
-  // Returns -1 if none.
   int8_t nextValidPlaylistIndex(uint8_t from) {
     const uint8_t len = Counters::idlePlaylistLen();
     if (len == 0) return -1;
@@ -49,38 +76,72 @@ namespace {
   void stopIdleScroller() {
     if (idleOwnsScroller) {
       idleOwnsScroller = false;
+      waitScrollerPass = false;
       if (Display::scrollerActive()) {
         Display::stopManualScroller(false);
       }
     }
   }
 
+  // out(prev) → in(next); caller stamps hold after this returns.
   bool showPlaylistStep(uint8_t idx) {
     IdleStep step = Counters::idleStep(idx);
     if (!stepIsValid(step)) return false;
-    const uint8_t effect = step.effect;
+    const uint8_t effectIn = step.effectIn;
+    const uint8_t effectOut = step.effectOut;
+    const uint8_t exitEff = prevOut;
 
     if (step.kind == IdleCounter) {
-      stopIdleScroller();
-      Counters::setActiveIndex(step.index, false);
-      Display::idleShowNext(Counters::getConst(step.index).count, effect);
+      uint8_t ci = step.index;
+      if (ci == IdleAutoIndex) {
+        int8_t n = nextEnabledFrom(cntCursor);
+        if (n < 0) return false;
+        ci = static_cast<uint8_t>(n);
+        cntCursor = static_cast<uint8_t>((ci + 1) % MAX_COUNTERS);
+      }
+      // Don't hard-clear — snapshot must see current pixels for the out anim.
+      if (idleOwnsScroller) {
+        idleOwnsScroller = false;
+        waitScrollerPass = false;
+      }
+      Display::animateDisplayedOff(exitEff);
+      Counters::setActiveIndex(ci, false);
+      Display::idleShowNext(Counters::getConst(ci).count, effectIn);
+      prevOut = effectOut;
       return true;
     }
 
-    // Message: idle-owned marquee (Left/Right set direction)
-    stopIdleScroller();
-    const char* msg = Counters::scrollMessage(step.index);
-    Display::startManualScroller(effect, msg);
+    // Message: startManualScroller snapshots + exit-animates with prevOut.
+    uint8_t mi = step.index;
+    if (mi == IdleAutoIndex) {
+      int8_t n = nextMessageFrom(msgCursor);
+      if (n < 0) return false;
+      mi = static_cast<uint8_t>(n);
+      const uint8_t msgN = Counters::scrollMessageCount();
+      msgCursor = msgN ? static_cast<uint8_t>((mi + 1) % msgN) : 0;
+    }
+    idleOwnsScroller = false;
+    waitScrollerPass = false;
+    const char* msg = Counters::scrollMessage(mi);
+    Display::startManualScroller(effectIn, msg, Counters::scrollMessageBottom(mi), exitEff);
     idleOwnsScroller = Display::scrollerActive();
+    // Only wait for a full pass when text actually scrolls (fit-only).
+    waitScrollerPass = idleOwnsScroller && !Display::scrollerCompletedPass();
+    prevOut = effectOut;
     return true;
   }
 
   bool advanceLegacyCounters() {
     int8_t n = nextEnabled(Counters::activeIndex());
     if (n < 0) return false;
-    stopIdleScroller();
+    if (idleOwnsScroller) {
+      idleOwnsScroller = false;
+      waitScrollerPass = false;
+    }
+    Display::animateDisplayedOff(prevOut);
     Counters::setActiveIndex(static_cast<uint8_t>(n), false);
-    Display::idleShowNext(Counters::getConst(n).count, Counters::idleEffect());
+    Display::idleShowNext(Counters::getConst(n).count, Counters::idleEffectIn());
+    prevOut = Counters::idleEffectOut();
     return true;
   }
 
@@ -96,6 +157,18 @@ namespace {
     playlistCursor = static_cast<uint8_t>((static_cast<uint8_t>(idx) + 1) % len);
     return true;
   }
+
+  bool holdElapsed(uint32_t now) {
+    // Scrolling messages: advance as soon as one full marquee pass finishes.
+    if (waitScrollerPass) {
+      if (Display::scrollerActive() && !Display::scrollerCompletedPass()) return false;
+      waitScrollerPass = false;
+      return true;
+    }
+    // Counters / static (fit) messages: hold for idle cycle seconds.
+    const uint32_t holdMs = (uint32_t)Counters::idleCycleSeconds() * 1000UL;
+    return (now - lastCycleMs) >= holdMs;
+  }
 }
 
 namespace IdleCycle {
@@ -105,7 +178,11 @@ void begin() {
   lastCycleMs = millis();
   cycling = false;
   idleOwnsScroller = false;
+  waitScrollerPass = false;
   playlistCursor = 0;
+  msgCursor = 0;
+  cntCursor = 0;
+  prevOut = Counters::idleEffectOut();
 }
 
 void noteActivity() {
@@ -120,7 +197,6 @@ void noteActivity() {
 bool isCycling() { return cycling; }
 
 void loop() {
-  // Manual (remote/web) scroller blocks idle; idle-owned marquee does not.
   if (Display::scrollerActive() && !idleOwnsScroller) {
     return;
   }
@@ -135,7 +211,6 @@ void loop() {
     return;
   }
 
-  // Don't cycle while blanked fully off
   if (Counters::blanked() && Counters::blankBrightnessPercent() == 0) {
     return;
   }
@@ -145,22 +220,29 @@ void loop() {
   if (!cycling) {
     if (now - lastActivityMs >= (uint32_t)Counters::idleTimeoutSeconds() * 1000UL) {
       cycling = true;
-      lastCycleMs = now;
       playlistCursor = 0;
+      msgCursor = 0;
+      cntCursor = 0;
+      waitScrollerPass = false;
+      prevOut = Counters::idleEffectOut();
       Serial.println(F("[idle] start cycle"));
       if (!advanceOnce()) {
         cycling = false;
+      } else {
+        // Hold starts after enter finishes (advanceOnce is blocking on anims).
+        lastCycleMs = millis();
       }
     }
     return;
   }
 
-  if (now - lastCycleMs >= (uint32_t)Counters::idleCycleSeconds() * 1000UL) {
-    lastCycleMs = now;
-    if (!advanceOnce()) {
-      cycling = false;
-      stopIdleScroller();
-    }
+  if (!holdElapsed(now)) return;
+
+  if (!advanceOnce()) {
+    cycling = false;
+    stopIdleScroller();
+  } else {
+    lastCycleMs = millis();
   }
 }
 
