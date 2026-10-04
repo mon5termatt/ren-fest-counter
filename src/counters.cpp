@@ -19,6 +19,7 @@ namespace {
   uint16_t idleTimeoutSec = 30;  // seconds before attract cycle starts
   uint8_t scrollSpd = 5;
   uint8_t teeterSpd = 5;
+  uint8_t effectSpd[ShowMode::COUNT];
   char scrollMessages[MAX_SCROLL_MESSAGES][SCROLLER_MAX_LEN + 1];
   char scrollBottoms[MAX_SCROLL_MESSAGES][SCROLLER_BOTTOM_MAX_LEN + 1];
   uint8_t scrollMsgCount = 1;
@@ -44,8 +45,15 @@ namespace {
 
   uint8_t clampScroll(uint8_t s) {
     if (s < 1) return 1;
-    if (s > 10) return 10;
+    if (s > 20) return 20;
     return s;
+  }
+
+  void fillEffectSpeeds(uint8_t fill) {
+    fill = clampScroll(fill);
+    for (uint8_t i = 0; i < ShowMode::COUNT; i++) {
+      effectSpd[i] = fill;
+    }
   }
 
   uint8_t clampMsgCount(uint8_t n) {
@@ -86,6 +94,7 @@ namespace {
     idleTimeoutSec = 30;
     scrollSpd = 5;
     teeterSpd = 5;
+    fillEffectSpeeds(5);
     clearMessages();
     idlePlLen = 0;
   }
@@ -127,6 +136,15 @@ void load() {
   idleTimeoutSec = clampTimeoutSec(prefs.getUShort("idleTo", 30));
   scrollSpd = clampScroll(prefs.getUChar("scrollSpd", 5));
   teeterSpd = clampScroll(prefs.getUChar("teeterSpd", 5));
+  // Per-anim speeds; missing keys default to marquee/global scrollSpd.
+  fillEffectSpeeds(scrollSpd);
+  for (uint8_t i = 0; i < ShowMode::COUNT; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "esp%u", i);
+    if (prefs.isKey(key)) {
+      effectSpd[i] = clampScroll(prefs.getUChar(key, scrollSpd));
+    }
+  }
 
   clearMessages();
   if (prefs.isKey("msgCnt")) {
@@ -221,6 +239,11 @@ void save() {
   prefs.putUShort("idleTo", idleTimeoutSec);
   prefs.putUChar("scrollSpd", scrollSpd);
   prefs.putUChar("teeterSpd", teeterSpd);
+  for (uint8_t i = 0; i < ShowMode::COUNT; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "esp%u", i);
+    prefs.putUChar(key, effectSpd[i]);
+  }
   prefs.putUChar("msgCnt", scrollMsgCount);
   for (uint8_t i = 0; i < MAX_SCROLL_MESSAGES; i++) {
     char key[8];
@@ -457,6 +480,27 @@ uint8_t scrollSpeed() { return scrollSpd; }
 
 void setScrollSpeed(uint8_t speed) {
   scrollSpd = clampScroll(speed);
+  markDirty();
+}
+
+uint8_t effectSpeed(uint8_t showMode) {
+  if (!ShowMode::valid(showMode)) return scrollSpd;
+  if (showMode == ShowMode::RANDOM || showMode == ShowMode::FREEZE) return scrollSpd;
+  return effectSpd[showMode];
+}
+
+void setEffectSpeed(uint8_t showMode, uint8_t speed) {
+  if (!ShowMode::valid(showMode)) return;
+  effectSpd[showMode] = clampScroll(speed);
+  markDirty();
+}
+
+void setEffectSpeeds(const uint8_t* speeds, uint8_t count) {
+  if (!speeds) return;
+  if (count > ShowMode::COUNT) count = ShowMode::COUNT;
+  for (uint8_t i = 0; i < count; i++) {
+    effectSpd[i] = clampScroll(speeds[i]);
+  }
   markDirty();
 }
 

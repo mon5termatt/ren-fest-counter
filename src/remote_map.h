@@ -10,7 +10,7 @@ namespace RemoteMap {
     ACTION_DEC_ACTIVE = 3,
     ACTION_BLANK = 4,
     ACTION_UNBLANK = 5,
-    ACTION_SCROLLER = 6,    // toggle manual marquee of scrollMessage
+    ACTION_SCROLLER = 6,    // toggle cycling marquee of all scrollMessages
   };
 
   struct Binding {
@@ -19,6 +19,7 @@ namespace RemoteMap {
     uint8_t param;
     uint8_t effectIn;   // ShowMode for enter / action play
     uint8_t effectOut;  // ShowMode for exit transition
+    uint8_t speed;      // 1–20, or 0 = use per-anim default
   };
 
   void begin();
@@ -32,7 +33,7 @@ namespace RemoteMap {
   uint8_t bindingCount();
   Binding getBinding(uint8_t index);
   bool setBinding(uint8_t buttonId, uint8_t action, uint8_t param,
-                  uint8_t effectIn, uint8_t effectOut);
+                  uint8_t effectIn, uint8_t effectOut, uint8_t speed = 0);
 
   const uint8_t* knownButtons(uint8_t& count);
   const char* buttonLabel(uint8_t buttonId);

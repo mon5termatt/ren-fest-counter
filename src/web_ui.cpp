@@ -52,6 +52,20 @@ namespace {
   .list-row { display:grid; grid-template-columns:1fr auto; gap:.5rem; align-items:end; margin-bottom:.45rem; }
   .list-row.msg { grid-template-columns:1fr 1fr; align-items:start; }
   .list-row.playlist { grid-template-columns:1fr 1.2fr 1fr 1fr auto; }
+  .anim-speeds-drop { margin-top:.35rem; border:1px solid var(--line); border-radius:6px; background:#17120c; }
+  .anim-speeds-drop > summary {
+    cursor:pointer; list-style:none; padding:.55rem .7rem; color:#e8d3b0; font-size:.9rem;
+    display:flex; align-items:center; justify-content:space-between; user-select:none;
+  }
+  .anim-speeds-drop > summary::-webkit-details-marker { display:none; }
+  .anim-speeds-drop > summary::after { content:"▾"; color:var(--muted); font-size:.85rem; transition:transform .15s; }
+  .anim-speeds-drop[open] > summary::after { transform:rotate(-180deg); }
+  .anim-speeds { display:grid; grid-template-columns:1fr; gap:.55rem; padding:.35rem .7rem .75rem; }
+  .anim-speeds label { margin:0; font-size:.8rem; display:flex; justify-content:space-between; gap:.5rem; }
+  .anim-speeds input[type=range] { width:100%; margin-top:.15rem; }
+  @media (min-width:560px){
+    .anim-speeds { grid-template-columns:1fr 1fr; gap:.55rem .9rem; }
+  }
   .mini-actions { display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.35rem; }
   .mini-actions button { padding:.3rem .65rem; font-size:.85rem; }
   @media (max-width:600px){ .row,.row3{ grid-template-columns:1fr; } .list-row,.list-row.playlist{ grid-template-columns:1fr; } }
@@ -106,19 +120,24 @@ namespace {
     </div>
     <div class="row" style="margin-top:.75rem">
       <div>
-        <label for="scrollSpeed">Transition speed <span id="scrollSpeedVal">5</span> (1–10, up to 3× horiz.)</label>
-        <input id="scrollSpeed" type="range" min="1" max="10" step="1"/>
+        <label for="scrollSpeed">Marquee speed <span id="scrollSpeedVal">5</span> (1–20)</label>
+        <input id="scrollSpeed" type="range" min="1" max="20" step="1"/>
       </div>
       <div>
-        <label for="teeterSpeed">Teeter speed <span id="teeterSpeedVal">5</span></label>
-        <input id="teeterSpeed" type="range" min="1" max="10" step="1"/>
+        <label for="teeterSpeed">Teeter speed <span id="teeterSpeedVal">5</span> (1–20)</label>
+        <input id="teeterSpeed" type="range" min="1" max="20" step="1"/>
       </div>
     </div>
+    <details class="anim-speeds-drop" id="animSpeedsDrop">
+      <summary>Anim speeds (1–20)</summary>
+      <p class="sub" style="margin:0 .7rem .35rem">Each transition type uses its own speed. Random uses the picked anim's speed. Keymap Speed overrides for that button (0 = use anim default).</p>
+      <div class="anim-speeds" id="animSpeeds"></div>
+    </details>
   </section>
 
   <section>
     <h2>Scroller</h2>
-    <p class="sub" style="margin:0 0 .5rem">Top line scrolls; bottom line shows where the counter usually is. Message 1 is used by remote/web Show.</p>
+    <p class="sub" style="margin:0 0 .5rem">Night / Show cycles all non-empty messages until Stop (or Night again). Scrolling lines loop; short lines hold for Idle cycle seconds between messages.</p>
     <div id="scrollMessages"></div>
     <div class="mini-actions">
       <button type="button" class="secondary" id="btnMsgAdd">+ message</button>
@@ -158,9 +177,9 @@ namespace {
       <button type="button" class="secondary" id="btnUnlink">Clear link</button>
     </div>
     <h2 style="margin-top:1.25rem">Key map</h2>
-    <p class="sub" style="margin:0 0 .5rem">Tap fires immediately. In = enter / play; Out = exit when leaving current content.</p>
+    <p class="sub" style="margin:0 0 .5rem">Tap fires immediately. In = enter / play; Out = exit when leaving. Speed 0 = anim default (1–20).</p>
     <table>
-      <thead><tr><th>Button</th><th>Tap</th><th>Counter</th><th>In</th><th>Out</th></tr></thead>
+      <thead><tr><th>Button</th><th>Tap</th><th>Counter</th><th>In</th><th>Out</th><th>Speed</th></tr></thead>
       <tbody id="keymap"></tbody>
     </table>
   </section>
@@ -235,6 +254,8 @@ const ANIM_OPTS = [
   {v:10,t:'Rotate'},
   {v:11,t:'Random'}
 ];
+// Speed-tunable modes (skip None / Random)
+const ANIM_SPEED_OPTS = ANIM_OPTS.filter(o => o.v !== 4 && o.v !== 11);
 
 function animOptions(selected){
   return ANIM_OPTS.map(o=>`<option value="${o.v}" ${o.v===selected?'selected':''}>${o.t}</option>`).join('');
@@ -274,6 +295,23 @@ function render(){
   const tspd = (state.teeterSpeed != null) ? state.teeterSpeed : 5;
   el('teeterSpeed').value = tspd;
   el('teeterSpeedVal').textContent = tspd;
+
+  if (!state.effectSpeeds || typeof state.effectSpeeds !== 'object') {
+    state.effectSpeeds = {};
+  }
+  const spdBox = el('animSpeeds');
+  spdBox.innerHTML = '';
+  ANIM_SPEED_OPTS.forEach(o=>{
+    const v = (state.effectSpeeds[o.v] != null) ? state.effectSpeeds[o.v]
+            : ((state.effectSpeeds[String(o.v)] != null) ? state.effectSpeeds[String(o.v)] : spd);
+    const d = document.createElement('div');
+    d.innerHTML = `<label for="esp${o.v}"><span>${o.t}</span><span id="espVal${o.v}">${v}</span></label>
+      <input id="esp${o.v}" type="range" min="1" max="20" step="1" data-esp="${o.v}" value="${v}"/>`;
+    spdBox.appendChild(d);
+    const inp = d.querySelector('input');
+    const valEl = d.querySelector(`#espVal${o.v}`);
+    inp.oninput = ()=>{ valEl.textContent = inp.value; };
+  });
 
   if (!Array.isArray(state.scrollMessages) || !state.scrollMessages.length) {
     state.scrollMessages = [{top: state.scrollMessage || '', bottom: ''}];
@@ -407,6 +445,7 @@ function render(){
     const tr = document.createElement('tr');
     const eIn = (b.effectIn != null) ? b.effectIn : ((b.effect != null) ? b.effect : 0);
     const eOut = (b.effectOut != null) ? b.effectOut : ((b.effect2 != null) ? b.effect2 : 0);
+    const spd = (b.speed != null) ? b.speed : 0;
     const selAct = ACTION_OPTS.map(o=>`<option value="${o.v}" ${o.v===b.action?'selected':''}>${o.t}</option>`).join('');
     let selCnt = '';
     for(let i=0;i<state.counters.length;i++){
@@ -417,7 +456,8 @@ function render(){
       <td><select data-btn="${b.buttonId}" data-f="action">${selAct}</select></td>
       <td><select data-btn="${b.buttonId}" data-f="param" ${b.action===1?'':'disabled'}>${selCnt}</select></td>
       <td><select data-btn="${b.buttonId}" data-f="effectIn">${animOptions(eIn)}</select></td>
-      <td><select data-btn="${b.buttonId}" data-f="effectOut">${animOptions(eOut)}</select></td>`;
+      <td><select data-btn="${b.buttonId}" data-f="effectOut">${animOptions(eOut)}</select></td>
+      <td><input type="number" min="0" max="20" data-btn="${b.buttonId}" data-f="speed" value="${spd}" title="0 = anim default" style="width:3.5rem"/></td>`;
     km.appendChild(tr);
   });
 
@@ -477,6 +517,16 @@ function collect(){
     idleTimeoutSeconds: +el('idleTimeoutSec').value,
     scrollSpeed: +el('scrollSpeed').value,
     teeterSpeed: +el('teeterSpeed').value,
+    effectSpeeds: (()=>{
+      const o = {};
+      document.querySelectorAll('input[data-esp]').forEach(inp=>{
+        let v = +inp.value;
+        if (v < 1) v = 1;
+        if (v > 20) v = 20;
+        o[inp.dataset.esp] = v;
+      });
+      return o;
+    })(),
     scrollMessages: state.scrollMessages.slice(),
     idlePlaylist: state.idlePlaylist.slice(),
     counters: state.counters.map((c,i)=>{
@@ -490,7 +540,10 @@ function collect(){
       const param = +document.querySelector(`select[data-btn="${b.buttonId}"][data-f=param]`).value;
       const effectIn = +document.querySelector(`select[data-btn="${b.buttonId}"][data-f=effectIn]`).value;
       const effectOut = +document.querySelector(`select[data-btn="${b.buttonId}"][data-f=effectOut]`).value;
-      return { buttonId: b.buttonId, action, param, effectIn, effectOut };
+      let speed = +document.querySelector(`input[data-btn="${b.buttonId}"][data-f=speed]`).value;
+      if (speed < 0) speed = 0;
+      if (speed > 20) speed = 20;
+      return { buttonId: b.buttonId, action, param, effectIn, effectOut, speed };
     }),
     linkMac: state.linkedMac || ''
   };
@@ -714,6 +767,15 @@ setInterval(async ()=>{
     doc["idleTimeoutSeconds"] = Counters::idleTimeoutSeconds();
     doc["scrollSpeed"] = Counters::scrollSpeed();
     doc["teeterSpeed"] = Counters::teeterSpeed();
+    {
+      JsonObject esp = doc["effectSpeeds"].to<JsonObject>();
+      for (uint8_t i = 0; i < ShowMode::COUNT; i++) {
+        if (i == ShowMode::FREEZE || i == ShowMode::RANDOM) continue;
+        char key[4];
+        snprintf(key, sizeof(key), "%u", i);
+        esp[key] = Counters::effectSpeed(i);
+      }
+    }
     doc["scrollMessage"] = Counters::scrollMessage();  // legacy alias = message 0 top
 
     JsonArray msgs = doc["scrollMessages"].to<JsonArray>();
@@ -752,6 +814,7 @@ setInterval(async ()=>{
       o["param"] = b.param;
       o["effectIn"] = b.effectIn;
       o["effectOut"] = b.effectOut;
+      o["speed"] = b.speed;
       o["label"] = RemoteMap::buttonLabel(b.buttonId);
     }
 
@@ -796,6 +859,15 @@ setInterval(async ()=>{
     }
     if (!doc["teeterSpeed"].isNull()) {
       Counters::setTeeterSpeed(doc["teeterSpeed"].as<uint8_t>());
+    }
+    {
+      JsonObject esp = doc["effectSpeeds"].as<JsonObject>();
+      if (!esp.isNull()) {
+        for (JsonPair kv : esp) {
+          uint8_t mode = static_cast<uint8_t>(atoi(kv.key().c_str()));
+          Counters::setEffectSpeed(mode, kv.value().as<uint8_t>());
+        }
+      }
     }
 
     JsonArray msgs = doc["scrollMessages"].as<JsonArray>();
@@ -902,7 +974,8 @@ setInterval(async ()=>{
                            : (!o["effect"].isNull() ? o["effect"].as<uint8_t>() : ShowMode::LEFT);
         uint8_t effectOut = !o["effectOut"].isNull() ? o["effectOut"].as<uint8_t>()
                             : (!o["effect2"].isNull() ? o["effect2"].as<uint8_t>() : ShowMode::LEFT);
-        RemoteMap::setBinding(buttonId, action, param, effectIn, effectOut);
+        uint8_t speed = o["speed"].isNull() ? 0 : o["speed"].as<uint8_t>();
+        RemoteMap::setBinding(buttonId, action, param, effectIn, effectOut, speed);
       }
       RemoteMap::save();
     }

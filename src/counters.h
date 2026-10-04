@@ -80,6 +80,11 @@ namespace Counters {
   uint8_t scrollSpeed();
   void setScrollSpeed(uint8_t speed);
 
+  // Per-ShowMode transition speed (1–20). RANDOM uses the resolved mode's speed.
+  uint8_t effectSpeed(uint8_t showMode);
+  void setEffectSpeed(uint8_t showMode, uint8_t speed);
+  void setEffectSpeeds(const uint8_t* speeds, uint8_t count);
+
   uint8_t teeterSpeed();
   void setTeeterSpeed(uint8_t speed);
 

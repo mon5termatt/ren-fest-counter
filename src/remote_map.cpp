@@ -40,14 +40,22 @@ namespace {
     return ShowMode::valid(e) ? e : ShowMode::LEFT;
   }
 
+  uint8_t clampSpeed(uint8_t s) {
+    if (s == 0) return 0;  // 0 = use anim-type default
+    if (s > 20) return 20;
+    return s;
+  }
+
   void setDefault(uint8_t id, uint8_t act, uint8_t param,
-                  uint8_t effectIn, uint8_t effectOut = ShowMode::LEFT) {
+                  uint8_t effectIn, uint8_t effectOut = ShowMode::LEFT,
+                  uint8_t speed = 0) {
     for (uint8_t i = 0; i < KNOWN_COUNT; i++) {
       if (bindings[i].buttonId == id) {
         bindings[i].action = act;
         bindings[i].param = param;
         bindings[i].effectIn = effectIn;
         bindings[i].effectOut = effectOut;
+        bindings[i].speed = speed;
         return;
       }
     }
@@ -60,6 +68,7 @@ namespace {
       bindings[i].param = 0;
       bindings[i].effectIn = ShowMode::LEFT;
       bindings[i].effectOut = ShowMode::LEFT;
+      bindings[i].speed = 0;
     }
 
     setDefault(WIZ_ONE, RemoteMap::ACTION_SELECT, 0, ShowMode::LEFT, ShowMode::LEFT);
@@ -70,16 +79,18 @@ namespace {
     setDefault(WIZ_BRIGHT_DOWN, RemoteMap::ACTION_DEC_ACTIVE, 0, ShowMode::DOWN, ShowMode::LEFT);
     setDefault(WIZ_ON, RemoteMap::ACTION_UNBLANK, 0, ShowMode::FREEZE, ShowMode::FREEZE);
     setDefault(WIZ_OFF, RemoteMap::ACTION_BLANK, 0, ShowMode::FREEZE, ShowMode::FREEZE);
-    setDefault(WIZ_NIGHT, RemoteMap::ACTION_NONE, 0, ShowMode::FREEZE, ShowMode::FREEZE);
+    setDefault(WIZ_NIGHT, RemoteMap::ACTION_SCROLLER, 0, ShowMode::LEFT, ShowMode::LEFT);
   }
 
-  void execute(uint8_t action, uint8_t param, uint8_t effectIn, uint8_t effectOut) {
+  void execute(uint8_t action, uint8_t param, uint8_t effectIn, uint8_t effectOut,
+               uint8_t speed) {
     const uint8_t inEff = clampEffect(effectIn);
     const uint8_t outEff = clampEffect(effectOut);
+    const uint8_t spd = clampSpeed(speed);
 
     if (action != RemoteMap::ACTION_SCROLLER && Display::scrollerActive()) {
       // Animate marquee off with this key's out, then continue the action.
-      Display::animateDisplayedOff(outEff);
+      Display::animateDisplayedOff(outEff, spd);
       Display::stopManualScroller(action != RemoteMap::ACTION_SELECT);
     }
 
@@ -90,10 +101,10 @@ namespace {
       case RemoteMap::ACTION_SELECT:
         if (Counters::isEnabled(param)) {
           Counters::setActiveIndex(param);
-          Display::selectShow(inEff);
+          Display::selectShow(inEff, spd);
           Counters::saveIfDirty();
-          Serial.printf("[wiz] select counter %u (%s) in %u out %u\n", param + 1,
-                        Counters::getConst(param).name, inEff, outEff);
+          Serial.printf("[wiz] select counter %u (%s) in %u out %u spd %u\n", param + 1,
+                        Counters::getConst(param).name, inEff, outEff, spd);
         } else {
           Serial.printf("[wiz] select %u ignored (disabled)\n", param + 1);
         }
@@ -102,7 +113,7 @@ namespace {
       case RemoteMap::ACTION_INC_ACTIVE: {
         uint8_t a = Counters::activeIndex();
         if (Counters::inc(a)) {
-          Display::onCountIncreased(Counters::getConst(a).count, inEff);
+          Display::onCountIncreased(Counters::getConst(a).count, inEff, spd);
           Counters::saveIfDirty();
         }
         break;
@@ -111,7 +122,7 @@ namespace {
       case RemoteMap::ACTION_DEC_ACTIVE: {
         uint8_t a = Counters::activeIndex();
         if (Counters::dec(a)) {
-          Display::onCountDecreased(Counters::getConst(a).count, inEff);
+          Display::onCountDecreased(Counters::getConst(a).count, inEff, spd);
           Counters::saveIfDirty();
         }
         break;
@@ -132,11 +143,11 @@ namespace {
       case RemoteMap::ACTION_SCROLLER:
         IdleCycle::noteActivity();
         if (Display::scrollerActive()) {
-          Display::animateDisplayedOff(outEff);
+          Display::animateDisplayedOff(outEff, spd);
           Display::stopManualScroller();
           Serial.println(F("[wiz] scroller stop"));
         } else {
-          Display::startManualScroller(inEff, nullptr, nullptr, outEff);
+          Display::startManualScroller(inEff, nullptr, nullptr, outEff, spd);
           Serial.println(F("[wiz] scroller start"));
         }
         break;
@@ -166,16 +177,18 @@ void load() {
   if (!prefs.begin("rfremote", true)) return;
 
   for (uint8_t i = 0; i < KNOWN_COUNT; i++) {
-    char keyA[8], keyP[8], keyE[8], keyE2[8];
+    char keyA[8], keyP[8], keyE[8], keyE2[8], keyS[8];
     snprintf(keyA, sizeof(keyA), "a%u", bindings[i].buttonId);
     snprintf(keyP, sizeof(keyP), "p%u", bindings[i].buttonId);
     snprintf(keyE, sizeof(keyE), "e%u", bindings[i].buttonId);
     snprintf(keyE2, sizeof(keyE2), "E%u", bindings[i].buttonId);
+    snprintf(keyS, sizeof(keyS), "s%u", bindings[i].buttonId);
     bindings[i].action = prefs.getUChar(keyA, bindings[i].action);
     bindings[i].param = prefs.getUChar(keyP, bindings[i].param);
     // Legacy: e = effectIn, E = effectOut (was double-tap effect)
     bindings[i].effectIn = clampEffect(prefs.getUChar(keyE, bindings[i].effectIn));
     bindings[i].effectOut = clampEffect(prefs.getUChar(keyE2, bindings[i].effectOut));
+    bindings[i].speed = clampSpeed(prefs.getUChar(keyS, 0));
   }
 
   prefs.end();
@@ -185,17 +198,19 @@ void save() {
   if (!prefs.begin("rfremote", false)) return;
 
   for (uint8_t i = 0; i < KNOWN_COUNT; i++) {
-    char keyA[8], keyP[8], keyA2[8], keyP2[8], keyE[8], keyE2[8];
+    char keyA[8], keyP[8], keyA2[8], keyP2[8], keyE[8], keyE2[8], keyS[8];
     snprintf(keyA, sizeof(keyA), "a%u", bindings[i].buttonId);
     snprintf(keyP, sizeof(keyP), "p%u", bindings[i].buttonId);
     snprintf(keyA2, sizeof(keyA2), "A%u", bindings[i].buttonId);
     snprintf(keyP2, sizeof(keyP2), "P%u", bindings[i].buttonId);
     snprintf(keyE, sizeof(keyE), "e%u", bindings[i].buttonId);
     snprintf(keyE2, sizeof(keyE2), "E%u", bindings[i].buttonId);
+    snprintf(keyS, sizeof(keyS), "s%u", bindings[i].buttonId);
     prefs.putUChar(keyA, bindings[i].action);
     prefs.putUChar(keyP, bindings[i].param);
     prefs.putUChar(keyE, bindings[i].effectIn);
     prefs.putUChar(keyE2, bindings[i].effectOut);
+    prefs.putUChar(keyS, bindings[i].speed);
     prefs.remove(keyA2);
     prefs.remove(keyP2);
   }
@@ -210,20 +225,20 @@ void handleButton(uint8_t buttonId) {
   IdleCycle::noteActivity();
 
   const Binding& b = bindings[idx];
-  execute(b.action, b.param, b.effectIn, b.effectOut);
+  execute(b.action, b.param, b.effectIn, b.effectOut, b.speed);
 }
 
 uint8_t bindingCount() { return KNOWN_COUNT; }
 
 Binding getBinding(uint8_t index) {
   if (index >= KNOWN_COUNT) {
-    return Binding{0, ACTION_NONE, 0, ShowMode::LEFT, ShowMode::LEFT};
+    return Binding{0, ACTION_NONE, 0, ShowMode::LEFT, ShowMode::LEFT, 0};
   }
   return bindings[index];
 }
 
 bool setBinding(uint8_t buttonId, uint8_t action, uint8_t param,
-                uint8_t effectIn, uint8_t effectOut) {
+                uint8_t effectIn, uint8_t effectOut, uint8_t speed) {
   int idx = findIndex(buttonId);
   if (idx < 0) return false;
   if (action > ACTION_SCROLLER) return false;
@@ -232,6 +247,7 @@ bool setBinding(uint8_t buttonId, uint8_t action, uint8_t param,
   bindings[idx].param = param;
   bindings[idx].effectIn = clampEffect(effectIn);
   bindings[idx].effectOut = clampEffect(effectOut);
+  bindings[idx].speed = clampSpeed(speed);
   return true;
 }
 

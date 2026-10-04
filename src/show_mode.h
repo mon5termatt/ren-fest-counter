@@ -36,6 +36,10 @@ namespace ShowMode {
     return m == LASER_LEFT || m == LASER_RIGHT || m == LASER_UP || m == LASER_DOWN;
   }
 
+  inline bool isLaserVert(uint8_t m) {
+    return m == LASER_UP || m == LASER_DOWN;
+  }
+
   // Resolve RANDOM → a fixed ShowMode for this play (never None/Freeze)
   inline uint8_t resolve(uint8_t m) {
     if (!valid(m)) return LEFT;

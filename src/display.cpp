@@ -48,6 +48,7 @@ namespace {
   struct PendingAnim {
     PendingKind kind = PendingKind::None;
     uint8_t effect = 0;
+    uint8_t speed = 0;  // 0 = use per-anim default
     int32_t count = 0;
   } pendingAnim;
 
@@ -141,41 +142,142 @@ namespace {
   // Max columns for a name glyph stream (15 chars * ~6px + spacing)
   constexpr uint16_t NAME_COL_BUF = 128;
 
-  // teeterSpeed 1..10 → frame ms ~80..15
+  // teeterSpeed 1..10 unchanged; 20 = 2× old max (20ms → 10ms)
   uint16_t teeterFrameMs() {
     uint8_t s = Counters::teeterSpeed();
     if (s < 1) s = 1;
-    if (s > 10) s = 10;
-    return static_cast<uint16_t>(90 - (s * 7));
+    if (s > 20) s = 20;
+    if (s <= 10) {
+      return static_cast<uint16_t>(90 - (s * 7));
+    }
+    // 10 → 20ms, 20 → 10ms
+    return static_cast<uint16_t>(20 - (s - 10));
   }
 
-  // Transition scroll: ms between column steps (lower = faster overall)
+  // Active transition speed (1–20) for the effect currently playing.
+  uint8_t currentAnimSpeed = 5;
+
+  void useAnimSpeed(uint8_t speed1to20) {
+    uint8_t s = speed1to20;
+    if (s < 1) s = 1;
+    if (s > 20) s = 20;
+    currentAnimSpeed = s;
+  }
+
+  // overrideSpd 0 → per-anim default from Counters::effectSpeed
+  void useEffectSpeed(uint8_t resolvedMode, uint8_t overrideSpd = 0) {
+    useAnimSpeed(overrideSpd ? overrideSpd : Counters::effectSpeed(resolvedMode));
+  }
+
+  void useMarqueeSpeed() {
+    useAnimSpeed(Counters::scrollSpeed());
+  }
+
+  // Transition scroll: ms between column steps (lower = faster overall).
+  // 1–10 match prior curve; 20 = 2× old max (8ms → 4ms).
   uint16_t transitionFrameMs() {
-    uint8_t s = Counters::scrollSpeed();
+    uint8_t s = currentAnimSpeed;
     if (s < 1) s = 1;
-    if (s > 10) s = 10;
-    // ~26ms at 1 → ~8ms at 10
-    return static_cast<uint16_t>(28 - ((s - 1) * 20) / 9);
+    if (s > 20) s = 20;
+    if (s <= 10) {
+      return static_cast<uint16_t>(28 - ((s - 1) * 20) / 9);
+    }
+    return static_cast<uint16_t>(8 - ((s - 10) * 4) / 10);
   }
 
-  // Horizontal scroll progress per frame: 1 at speed 1 → 3 at speed 10 (up to 3×)
+  // Horizontal scroll progress per frame: 1 at speed 1 → 3 at 10 → 6 at 20 (2× old max).
   uint8_t transitionStride() {
-    uint8_t s = Counters::scrollSpeed();
+    uint8_t s = currentAnimSpeed;
     if (s < 1) s = 1;
-    if (s > 10) s = 10;
-    return static_cast<uint8_t>(1 + ((s - 1) * 2) / 9);
+    if (s > 20) s = 20;
+    if (s <= 10) {
+      return static_cast<uint8_t>(1 + ((s - 1) * 2) / 9);
+    }
+    return static_cast<uint8_t>(3 + ((s - 10) * 3) / 10);
   }
 
-  // Parola effect speed (lower = faster); scale with scrollSpeed (transitions)
+  // Parola effect speed (lower = faster); scale with currentAnimSpeed.
+  // 1–10: prior (base*6)/s. 11–20: same formula → s=20 is half the tick of s=10 (2×).
   uint16_t parolaScrollSpeed(uint16_t base) {
-    uint8_t s = Counters::scrollSpeed();
+    uint8_t s = currentAnimSpeed;
     if (s < 1) s = 1;
-    if (s > 10) s = 10;
-    // Gentler than linear: keep mid speeds from feeling rushed
+    if (s > 20) s = 20;
     const int scaled = (static_cast<int>(base) * 6) / static_cast<int>(s);
-    if (scaled < 6) return 6;
+    // min 3 so s=20 can reach half of s=10 (old floor 6 capped the top)
+    if (scaled < 3) return 3;
     if (scaled > 80) return 80;
     return static_cast<uint16_t>(scaled);
+  }
+
+  // Laser wipe/slice run in a busy-wait that also polls IR/WiFi. One
+  // displayAnimate() per poll can't beat that overhead — catch up to the
+  // target tick for speeds above 10 only (1–10 keep stock Parola timing).
+  // Set to a ShowMode while waiting on that effect (ANIMATION needs huge bursts).
+  uint8_t parolaPumpMode = 0xFF;
+
+  struct {
+    uint32_t lastMs = 0;
+    int16_t accum = 0;
+  } parolaPump;
+
+  void resetParolaPump() {
+    parolaPump.lastMs = millis();
+    parolaPump.accum = 0;
+  }
+
+  void beginParolaPump(uint8_t mode) {
+    parolaPumpMode = mode;
+    resetParolaPump();
+  }
+
+  void endParolaPump() { parolaPumpMode = 0xFF; }
+
+  void pumpParolaAnimate() {
+    uint8_t s = currentAnimSpeed;
+    if (s < 1) s = 1;
+    if (s > 20) s = 20;
+
+    // PA_RANDOM reveals 1 pixel per animate (~88+ frames). Burst hard with speed.
+    if (parolaPumpMode == ShowMode::ANIMATION) {
+      // s=1 → 1, s=10 → 7, s=20 → 26 frames per poll
+      const uint8_t burst =
+          static_cast<uint8_t>(1 + (static_cast<uint16_t>(s) * s) / 16);
+      board->setSpeed(0);
+      for (uint8_t i = 0; i < burst; i++) {
+        board->displayAnimate();
+      }
+      return;
+    }
+
+    if (s <= 10) {
+      board->displayAnimate();
+      return;
+    }
+
+    uint16_t period = parolaScrollSpeed(40);  // ~22..12 ms for s=11..20
+    if (period < 1) period = 1;
+
+    const uint32_t now = millis();
+    if (parolaPump.lastMs == 0) {
+      parolaPump.lastMs = now;
+      return;
+    }
+    uint32_t dt = now - parolaPump.lastMs;
+    parolaPump.lastMs = now;
+    if (dt > 50) dt = 50;
+    parolaPump.accum =
+        static_cast<int16_t>(parolaPump.accum + static_cast<int16_t>(dt));
+
+    if (parolaPump.accum < static_cast<int16_t>(period)) return;
+
+    board->setSpeed(0);
+    uint8_t n = 0;
+    while (parolaPump.accum >= static_cast<int16_t>(period) && n < 4) {
+      parolaPump.accum =
+          static_cast<int16_t>(parolaPump.accum - static_cast<int16_t>(period));
+      board->displayAnimate();
+      n++;
+    }
   }
 
   struct NameTeeter {
@@ -210,6 +312,15 @@ namespace {
   char scrollerBottomBuf[SCROLLER_BOTTOM_MAX_LEN + 1] = "";
   textEffect_t scrollerDir = PA_SCROLL_LEFT;
   textEffect_t scrollerBottomDir = PA_SCROLL_LEFT;
+  // Night / web Start: keep rotating through all scrollMessages until stopped.
+  bool scrollerCycleAll = false;
+  bool scrollerHolding = false;       // static message hold between advances
+  bool scrollerAdvancing = false;     // re-entrancy guard
+  uint8_t scrollerCycleIdx = 0;
+  uint8_t scrollerCycleInEff = ShowMode::LEFT;
+  uint8_t scrollerCycleOutEff = ShowMode::LEFT;
+  uint8_t scrollerCycleSpeed = 0;
+  uint32_t scrollerHoldStartMs = 0;
 
   void setNameModulesIntensity(uint8_t intensity) {
     MD_MAX72XX* mx = board->getGraphicObject();
@@ -318,10 +429,436 @@ namespace {
     if (doUpdate) mx->update();
   }
 
+  // Vertical wipe-cursor (matches PA_WIPE_CURSOR / Laser Left): a full-row light
+  // bar sweeps and reveals text behind it. Parola SCAN_VERT only peels rows.
+  bool laserVertWipeZones(int8_t nz, const char* top, int8_t cz, const char* bot,
+                          bool up, bool entering,
+                          uint32_t nameGen, uint32_t numGen) {
+    MD_MAX72XX* mx = board->getGraphicObject();
+    if (!mx) return false;
+
+    auto stillOk = [&]() -> bool {
+      if (nz >= 0 && !animCurrent(AnimSlot::Name, nameGen)) return false;
+      if (cz >= 0 && !animCurrent(AnimSlot::Num, numGen)) return false;
+      return true;
+    };
+
+    auto settlePrint = [&](int8_t z, const char* text) -> bool {
+      if (z < 0 || !text) return true;
+      board->setCharSpacing(static_cast<uint8_t>(z), 1);
+      board->displayClear(static_cast<uint8_t>(z));
+      board->displayZoneText(static_cast<uint8_t>(z), text, PA_CENTER, 0, 0, PA_PRINT,
+                             PA_NO_EFFECT);
+      board->displayReset(static_cast<uint8_t>(z));
+      while (!board->getZoneStatus(static_cast<uint8_t>(z))) {
+        if (!stillOk()) return false;
+        board->displayAnimate();
+        pollDuringAnim();
+      }
+      return stillOk();
+    };
+
+    // Exit: snapshot what's already on screen (don't reprint — that flashes).
+    if (entering) {
+      if (!settlePrint(nz, top)) return false;
+      if (!settlePrint(cz, bot)) return false;
+    }
+
+    uint16_t nStart = 0, nEnd = 0, cStart = 0, cEnd = 0;
+    uint16_t nCols = 0, cCols = 0;
+    if (nz >= 0) {
+      board->getDisplayExtent(static_cast<uint8_t>(nz), nStart, nEnd);
+      nCols = static_cast<uint16_t>(nEnd - nStart + 1);
+    }
+    if (cz >= 0) {
+      board->getDisplayExtent(static_cast<uint8_t>(cz), cStart, cEnd);
+      cCols = static_cast<uint16_t>(cEnd - cStart + 1);
+    }
+
+    constexpr uint16_t kMaxCols = 96;
+    uint8_t nSnap[kMaxCols];
+    uint8_t cSnap[kMaxCols];
+    if (nCols > kMaxCols) nCols = kMaxCols;
+    if (cCols > kMaxCols) cCols = kMaxCols;
+    for (uint16_t i = 0; i < nCols; i++) nSnap[i] = mx->getColumn(nStart + i);
+    for (uint16_t i = 0; i < cCols; i++) cSnap[i] = mx->getColumn(cStart + i);
+
+    // Same tick as Laser Left (parolaScrollSpeed). Catch up after pollDuringAnim
+    // so high speeds aren't flattened to one row per IR/WiFi poll.
+    uint16_t period = parolaScrollSpeed(40);
+    if (period < 1) period = 1;
+
+    // Name strip is FLIP_UD — invert sweep so "Up" moves toward visual top.
+    const bool sweepUp = NAME_ZONE_FLIP_UD ? !up : up;
+
+    auto paintStep = [&](int step) {
+      const int barBit = sweepUp ? step : (7 - step);
+      uint8_t revealMask;
+      if (entering) {
+        revealMask = sweepUp
+                         ? static_cast<uint8_t>((barBit == 0) ? 0 : ((1u << barBit) - 1u))
+                         : static_cast<uint8_t>(0xFFu << (barBit + 1));
+      } else {
+        revealMask = sweepUp
+                         ? static_cast<uint8_t>(0xFFu << (barBit + 1))
+                         : static_cast<uint8_t>((1u << barBit) - 1u);
+      }
+      const uint8_t barMask = static_cast<uint8_t>(1u << barBit);
+
+      auto paint = [&](uint16_t start, uint16_t cols, const uint8_t* snap) {
+        for (uint16_t i = 0; i < cols; i++) {
+          // Light-bar only on columns with glyph ink (skip empty padding).
+          uint8_t out = static_cast<uint8_t>(snap[i] & revealMask);
+          if (snap[i]) out = static_cast<uint8_t>(out | barMask);
+          mx->setColumn(start + i, out);
+        }
+      };
+      paint(nStart, nCols, nSnap);
+      paint(cStart, cCols, cSnap);
+      mx->update();
+    };
+
+    uint32_t lastMs = millis();
+    int16_t accum = 0;
+    int step = 0;
+    while (step < 8) {
+      if (!stillOk()) return false;
+      pollDuringAnim();
+      const uint32_t now = millis();
+      uint32_t dt = now - lastMs;
+      lastMs = now;
+      if (dt > 50) dt = 50;
+      accum = static_cast<int16_t>(accum + static_cast<int16_t>(dt));
+      if (accum < static_cast<int16_t>(period)) continue;
+      while (accum >= static_cast<int16_t>(period) && step < 8) {
+        accum = static_cast<int16_t>(accum - static_cast<int16_t>(period));
+        paintStep(step);
+        step++;
+      }
+    }
+
+    if (entering) {
+      for (uint16_t i = 0; i < nCols; i++) mx->setColumn(nStart + i, nSnap[i]);
+      for (uint16_t i = 0; i < cCols; i++) mx->setColumn(cStart + i, cSnap[i]);
+      mx->update();
+    } else {
+      board->displayClear();
+    }
+    return stillOk();
+  }
+
+  // Sand-pile: each glyph row falls from the top and stacks at the bottom.
+  bool pilingSandZones(int8_t nz, const char* top, int8_t cz, const char* bot,
+                       bool entering, uint32_t nameGen, uint32_t numGen) {
+    MD_MAX72XX* mx = board->getGraphicObject();
+    if (!mx) return false;
+
+    auto stillOk = [&]() -> bool {
+      if (nz >= 0 && !animCurrent(AnimSlot::Name, nameGen)) return false;
+      if (cz >= 0 && !animCurrent(AnimSlot::Num, numGen)) return false;
+      return true;
+    };
+
+    auto settlePrint = [&](int8_t z, const char* text) -> bool {
+      if (z < 0 || !text) return true;
+      board->setCharSpacing(static_cast<uint8_t>(z), 1);
+      board->displayClear(static_cast<uint8_t>(z));
+      board->displayZoneText(static_cast<uint8_t>(z), text, PA_CENTER, 0, 0, PA_PRINT,
+                             PA_NO_EFFECT);
+      board->displayReset(static_cast<uint8_t>(z));
+      while (!board->getZoneStatus(static_cast<uint8_t>(z))) {
+        if (!stillOk()) return false;
+        board->displayAnimate();
+        pollDuringAnim();
+      }
+      return stillOk();
+    };
+
+    if (entering) {
+      if (!settlePrint(nz, top)) return false;
+      if (!settlePrint(cz, bot)) return false;
+    }
+
+    uint16_t nStart = 0, nEnd = 0, cStart = 0, cEnd = 0;
+    uint16_t nCols = 0, cCols = 0;
+    if (nz >= 0) {
+      board->getDisplayExtent(static_cast<uint8_t>(nz), nStart, nEnd);
+      nCols = static_cast<uint16_t>(nEnd - nStart + 1);
+    }
+    if (cz >= 0) {
+      board->getDisplayExtent(static_cast<uint8_t>(cz), cStart, cEnd);
+      cCols = static_cast<uint16_t>(cEnd - cStart + 1);
+    }
+
+    constexpr uint16_t kMaxCols = 96;
+    uint8_t nSnap[kMaxCols];
+    uint8_t cSnap[kMaxCols];
+    if (nCols > kMaxCols) nCols = kMaxCols;
+    if (cCols > kMaxCols) cCols = kMaxCols;
+    for (uint16_t i = 0; i < nCols; i++) nSnap[i] = mx->getColumn(nStart + i);
+    for (uint16_t i = 0; i < cCols; i++) cSnap[i] = mx->getColumn(cStart + i);
+
+    // Clear before piling in (start empty, sand falls in).
+    if (entering) {
+      for (uint16_t i = 0; i < nCols; i++) mx->setColumn(nStart + i, 0);
+      for (uint16_t i = 0; i < cCols; i++) mx->setColumn(cStart + i, 0);
+      mx->update();
+    }
+
+    uint16_t period = parolaScrollSpeed(40);
+    if (period < 1) period = 1;
+
+    // Device bit for visual bottom / top (name strip is FLIP_UD).
+    const int bottomBit = NAME_ZONE_FLIP_UD ? 7 : 0;
+    const int topBit = NAME_ZONE_FLIP_UD ? 0 : 7;
+    const int fallDir = NAME_ZONE_FLIP_UD ? 1 : -1;   // top → bottom
+    const int pileDir = NAME_ZONE_FLIP_UD ? -1 : 1;   // bottom → top (stack order)
+
+    auto layerHasInk = [&](int targetBit) -> bool {
+      const uint8_t m = static_cast<uint8_t>(1u << targetBit);
+      for (uint16_t i = 0; i < nCols; i++) {
+        if (nSnap[i] & m) return true;
+      }
+      for (uint16_t i = 0; i < cCols; i++) {
+        if (cSnap[i] & m) return true;
+      }
+      return false;
+    };
+
+    auto paintFrame = [&](uint8_t settledMask, int fallBit, int targetBit, bool showFall) {
+      auto paint = [&](uint16_t start, uint16_t cols, const uint8_t* snap) {
+        const uint8_t fallMask = static_cast<uint8_t>(1u << fallBit);
+        const uint8_t tgtMask = static_cast<uint8_t>(1u << targetBit);
+        for (uint16_t i = 0; i < cols; i++) {
+          uint8_t out = static_cast<uint8_t>(snap[i] & settledMask);
+          if (showFall && (snap[i] & tgtMask)) {
+            out = static_cast<uint8_t>(out | fallMask);
+          }
+          mx->setColumn(start + i, out);
+        }
+      };
+      paint(nStart, nCols, nSnap);
+      paint(cStart, cCols, cSnap);
+      mx->update();
+    };
+
+    uint32_t lastMs = millis();
+    int16_t accum = 0;
+    auto waitTick = [&]() -> bool {
+      while (true) {
+        if (!stillOk()) return false;
+        pollDuringAnim();
+        const uint32_t now = millis();
+        uint32_t dt = now - lastMs;
+        lastMs = now;
+        if (dt > 50) dt = 50;
+        accum = static_cast<int16_t>(accum + static_cast<int16_t>(dt));
+        if (accum < static_cast<int16_t>(period)) continue;
+        accum = static_cast<int16_t>(accum - static_cast<int16_t>(period));
+        return true;
+      }
+    };
+
+    if (entering) {
+      uint8_t settledMask = 0;
+      for (int layer = 0; layer < 8; layer++) {
+        const int targetBit = bottomBit + pileDir * layer;
+        if (!layerHasInk(targetBit)) {
+          settledMask = static_cast<uint8_t>(settledMask | (1u << targetBit));
+          continue;
+        }
+        // Drop this row from top down onto the pile.
+        for (int y = topBit; ; y += fallDir) {
+          if (!waitTick()) return false;
+          paintFrame(settledMask, y, targetBit, true);
+          if (y == targetBit) break;
+        }
+        settledMask = static_cast<uint8_t>(settledMask | (1u << targetBit));
+      }
+      for (uint16_t i = 0; i < nCols; i++) mx->setColumn(nStart + i, nSnap[i]);
+      for (uint16_t i = 0; i < cCols; i++) mx->setColumn(cStart + i, cSnap[i]);
+      mx->update();
+    } else {
+      // Unpile: top settled row lifts off upward.
+      uint8_t settledMask = 0xFF;
+      for (int layer = 7; layer >= 0; layer--) {
+        const int targetBit = bottomBit + pileDir * layer;
+        if (!layerHasInk(targetBit)) {
+          settledMask = static_cast<uint8_t>(settledMask & ~(1u << targetBit));
+          continue;
+        }
+        settledMask = static_cast<uint8_t>(settledMask & ~(1u << targetBit));
+        for (int y = targetBit; ; y -= fallDir) {
+          if (!waitTick()) return false;
+          paintFrame(settledMask, y, targetBit, true);
+          if (y == topBit) {
+            if (!waitTick()) return false;
+            paintFrame(settledMask, y, targetBit, false);
+            break;
+          }
+        }
+      }
+      board->displayClear();
+    }
+    return stillOk();
+  }
+
+  // True random pixel dissolve across the full zone (Parola PA_RANDOM repeats
+  // an 11-column mask, so it looks striped rather than random).
+  bool animationRandomZones(int8_t nz, const char* top, int8_t cz, const char* bot,
+                            bool entering, uint32_t nameGen, uint32_t numGen) {
+    MD_MAX72XX* mx = board->getGraphicObject();
+    if (!mx) return false;
+
+    auto stillOk = [&]() -> bool {
+      if (nz >= 0 && !animCurrent(AnimSlot::Name, nameGen)) return false;
+      if (cz >= 0 && !animCurrent(AnimSlot::Num, numGen)) return false;
+      return true;
+    };
+
+    auto settlePrint = [&](int8_t z, const char* text) -> bool {
+      if (z < 0 || !text) return true;
+      board->setCharSpacing(static_cast<uint8_t>(z), 1);
+      board->displayClear(static_cast<uint8_t>(z));
+      board->displayZoneText(static_cast<uint8_t>(z), text, PA_CENTER, 0, 0, PA_PRINT,
+                             PA_NO_EFFECT);
+      board->displayReset(static_cast<uint8_t>(z));
+      while (!board->getZoneStatus(static_cast<uint8_t>(z))) {
+        if (!stillOk()) return false;
+        board->displayAnimate();
+        pollDuringAnim();
+      }
+      return stillOk();
+    };
+
+    if (entering) {
+      if (!settlePrint(nz, top)) return false;
+      if (!settlePrint(cz, bot)) return false;
+    }
+
+    uint16_t nStart = 0, nEnd = 0, cStart = 0, cEnd = 0;
+    uint16_t nCols = 0, cCols = 0;
+    if (nz >= 0) {
+      board->getDisplayExtent(static_cast<uint8_t>(nz), nStart, nEnd);
+      nCols = static_cast<uint16_t>(nEnd - nStart + 1);
+    }
+    if (cz >= 0) {
+      board->getDisplayExtent(static_cast<uint8_t>(cz), cStart, cEnd);
+      cCols = static_cast<uint16_t>(cEnd - cStart + 1);
+    }
+
+    constexpr uint16_t kMaxCols = 96;
+    uint8_t nSnap[kMaxCols];
+    uint8_t cSnap[kMaxCols];
+    if (nCols > kMaxCols) nCols = kMaxCols;
+    if (cCols > kMaxCols) cCols = kMaxCols;
+    for (uint16_t i = 0; i < nCols; i++) nSnap[i] = mx->getColumn(nStart + i);
+    for (uint16_t i = 0; i < cCols; i++) cSnap[i] = mx->getColumn(cStart + i);
+
+    // Pack lit pixels: high byte = zone (0=name,1=num), low = col index; bit in separate nibble via packed uint16
+    // layout: (absCol << 3) | bit  — absCol fits in 13 bits for <96*2
+    constexpr uint16_t kMaxPix = 768;
+    uint16_t pix[kMaxPix];
+    uint16_t nPix = 0;
+    auto addCol = [&](uint16_t absCol, uint8_t snapByte) {
+      for (uint8_t b = 0; b < 8 && nPix < kMaxPix; b++) {
+        if (snapByte & (1u << b)) {
+          pix[nPix++] = static_cast<uint16_t>((absCol << 3) | b);
+        }
+      }
+    };
+    for (uint16_t i = 0; i < nCols; i++) addCol(static_cast<uint16_t>(nStart + i), nSnap[i]);
+    for (uint16_t i = 0; i < cCols; i++) addCol(static_cast<uint16_t>(cStart + i), cSnap[i]);
+
+    // Fisher–Yates shuffle
+    for (uint16_t i = nPix; i > 1; i--) {
+      const uint16_t j = static_cast<uint16_t>(random(i));
+      const uint16_t tmp = pix[i - 1];
+      pix[i - 1] = pix[j];
+      pix[j] = tmp;
+    }
+
+    if (entering) {
+      for (uint16_t i = 0; i < nCols; i++) mx->setColumn(nStart + i, 0);
+      for (uint16_t i = 0; i < cCols; i++) mx->setColumn(cStart + i, 0);
+      mx->update();
+    }
+
+    uint8_t s = currentAnimSpeed;
+    if (s < 1) s = 1;
+    if (s > 20) s = 20;
+    // Same tick as Laser / Piling. Burst sized so total steps stay visible:
+    // s=1 → ~90 steps (~7s), s=10 → ~60 (~1.4s), s=20 → ~30 (~0.4s).
+    uint16_t period = parolaScrollSpeed(40);
+    if (period < 1) period = 1;
+    const uint16_t steps =
+        static_cast<uint16_t>(30 + (20 - static_cast<uint16_t>(s)) * 3);
+    uint16_t burst = 1;
+    if (nPix > 0) {
+      burst = static_cast<uint16_t>((nPix + steps - 1) / steps);
+      if (burst < 1) burst = 1;
+    }
+
+    uint32_t lastMs = millis();
+    int16_t accum = 0;
+    auto waitTick = [&]() -> bool {
+      while (true) {
+        if (!stillOk()) return false;
+        pollDuringAnim();
+        const uint32_t now = millis();
+        uint32_t dt = now - lastMs;
+        lastMs = now;
+        if (dt > 50) dt = 50;
+        accum = static_cast<int16_t>(accum + static_cast<int16_t>(dt));
+        if (accum < static_cast<int16_t>(period)) continue;
+        accum = static_cast<int16_t>(accum - static_cast<int16_t>(period));
+        return true;
+      }
+    };
+
+    uint16_t done = 0;
+    while (done < nPix) {
+      if (!waitTick()) return false;
+      const uint16_t remain = static_cast<uint16_t>(nPix - done);
+      const uint16_t n = (remain < burst) ? remain : burst;
+      for (uint16_t k = 0; k < n; k++) {
+        const uint16_t p = pix[done++];
+        const uint16_t absCol = static_cast<uint16_t>(p >> 3);
+        const uint8_t bit = static_cast<uint8_t>(p & 7u);
+        const uint8_t mask = static_cast<uint8_t>(1u << bit);
+        uint8_t col = mx->getColumn(absCol);
+        if (entering) {
+          // Restore this pixel from the snapshot
+          uint8_t src = 0;
+          if (nz >= 0 && absCol >= nStart && absCol < nStart + nCols) {
+            src = nSnap[absCol - nStart];
+          } else if (cz >= 0 && absCol >= cStart && absCol < cStart + cCols) {
+            src = cSnap[absCol - cStart];
+          }
+          col = static_cast<uint8_t>(col | (src & mask));
+        } else {
+          col = static_cast<uint8_t>(col & ~mask);
+        }
+        mx->setColumn(absCol, col);
+      }
+      mx->update();
+    }
+
+    if (entering) {
+      for (uint16_t i = 0; i < nCols; i++) mx->setColumn(nStart + i, nSnap[i]);
+      for (uint16_t i = 0; i < cCols; i++) mx->setColumn(cStart + i, cSnap[i]);
+      mx->update();
+    } else {
+      board->displayClear();
+    }
+    return stillOk();
+  }
+
   // Exit with the same Parola effect used for enter (toParolaEffect).
   // resolved = already resolveEffect()'d.
   bool scrollDisplayedOff(uint8_t resolved, uint32_t nameGen, uint32_t numGen,
                           bool fromScroller) {
+    // Caller sets currentAnimSpeed via useEffectSpeed / useAnimSpeed.
     const int8_t nz = nameZoneId();
     const int8_t cz = numberZone();
     if (nz < 0 && cz < 0) return true;
@@ -354,9 +891,20 @@ namespace {
     if (!top[0]) strncpy(top, " ", sizeof(top));
     if (!bot[0]) strncpy(bot, " ", sizeof(bot));
 
+    if (ShowMode::isLaserVert(resolved)) {
+      return laserVertWipeZones(nz, top, cz, bot,
+                                resolved == ShowMode::LASER_UP, false, nameGen, numGen);
+    }
+    if (resolved == ShowMode::PILING) {
+      return pilingSandZones(nz, top, cz, bot, false, nameGen, numGen);
+    }
+    if (resolved == ShowMode::ANIMATION) {
+      return animationRandomZones(nz, top, cz, bot, false, nameGen, numGen);
+    }
+
     const textEffect_t outEff = toParolaEffect(resolved);
     uint16_t spd = parolaScrollSpeed(40);
-    if (resolved == ShowMode::ANIMATION) spd = 6;
+    if (resolved == ShowMode::ANIMATION) spd = 0;  // pump bursts pixels; tick unused
 
     // Instant print then out-effect — same Parola engine / mapping as enter.
     if (nz >= 0) {
@@ -372,12 +920,17 @@ namespace {
       board->displayReset(static_cast<uint8_t>(cz));
     }
 
+    beginParolaPump(resolved);
     while ((nz >= 0 && !board->getZoneStatus(static_cast<uint8_t>(nz))) ||
            (cz >= 0 && !board->getZoneStatus(static_cast<uint8_t>(cz)))) {
-      if (!stillOk()) return false;
-      board->displayAnimate();
+      if (!stillOk()) {
+        endParolaPump();
+        return false;
+      }
+      pumpParolaAnimate();
       pollDuringAnim();
     }
+    endParolaPump();
     return stillOk();
   }
 
@@ -483,7 +1036,7 @@ namespace {
     if (!animCurrent(AnimSlot::Num, numGen)) return false;
     const textEffect_t inEff = toParolaEffect(resolved);
     uint16_t spd = parolaScrollSpeed(40);
-    if (resolved == ShowMode::ANIMATION) spd = 6;
+    if (resolved == ShowMode::ANIMATION) spd = 0;  // pump bursts pixels; tick unused
     board->setCharSpacing(cz, 1);
     board->displayClear(cz);
     if (inEff == PA_PRINT || resolved == ShowMode::FREEZE) {
@@ -688,9 +1241,40 @@ namespace {
     };
 
     auto runDualParola = [&]() -> bool {
+      if (ShowMode::isLaserVert(resolved)) {
+        if (!laserVertWipeZones(static_cast<int8_t>(z), text,
+                                dual ? static_cast<int8_t>(numZone) : static_cast<int8_t>(-1),
+                                dual ? numText : nullptr,
+                                resolved == ShowMode::LASER_UP, true, gen,
+                                dual ? numGen : gen)) {
+          return false;
+        }
+        paintName(z, text);
+        return stillOk();
+      }
+      if (resolved == ShowMode::PILING) {
+        if (!pilingSandZones(static_cast<int8_t>(z), text,
+                             dual ? static_cast<int8_t>(numZone) : static_cast<int8_t>(-1),
+                             dual ? numText : nullptr, true, gen,
+                             dual ? numGen : gen)) {
+          return false;
+        }
+        paintName(z, text);
+        return stillOk();
+      }
+      if (resolved == ShowMode::ANIMATION) {
+        if (!animationRandomZones(static_cast<int8_t>(z), text,
+                                  dual ? static_cast<int8_t>(numZone) : static_cast<int8_t>(-1),
+                                  dual ? numText : nullptr, true, gen,
+                                  dual ? numGen : gen)) {
+          return false;
+        }
+        paintName(z, text);
+        return stillOk();
+      }
       const textEffect_t inEff = toParolaEffect(resolved);
       uint16_t spd = parolaScrollSpeed(40);
-      if (resolved == ShowMode::ANIMATION) spd = 6;
+      if (resolved == ShowMode::ANIMATION) spd = 0;  // pump bursts pixels; tick unused
       board->displayClear(z);
       if (dual) board->displayClear(numZone);
       if (dual) board->setCharSpacing(numZone, 1);
@@ -700,11 +1284,16 @@ namespace {
         board->displayZoneText(numZone, numText, PA_CENTER, spd, 0, inEff, PA_NO_EFFECT);
         board->displayReset(numZone);
       }
+      beginParolaPump(resolved);
       while (!board->getZoneStatus(z) || (dual && !board->getZoneStatus(numZone))) {
-        if (!stillOk()) return false;
-        board->displayAnimate();
+        if (!stillOk()) {
+          endParolaPump();
+          return false;
+        }
+        pumpParolaAnimate();
         pollDuringAnim();
       }
+      endParolaPump();
       paintName(z, text);
       return stillOk();
     };
@@ -889,19 +1478,25 @@ namespace {
 
   // Returns false if superseded by a newer animation
   bool runZoneAnim(uint8_t zone, const char* text, textEffect_t inEff, textEffect_t outEff,
-                   uint16_t speed, uint16_t pauseMs, uint32_t gen, AnimSlot slot) {
+                   uint16_t speed, uint16_t pauseMs, uint32_t gen, AnimSlot slot,
+                   uint8_t pumpMode = 0xFF) {
     if (!animCurrent(slot, gen)) return false;
 
     board->displayClear(zone);
     board->displayZoneText(zone, text, PA_CENTER, speed, pauseMs, inEff, outEff);
     board->displayReset(zone);
+    beginParolaPump(pumpMode);
     while (!board->getZoneStatus(zone)) {
-      if (!animCurrent(slot, gen)) return false;
-      board->displayAnimate();
+      if (!animCurrent(slot, gen)) {
+        endParolaPump();
+        return false;
+      }
+      pumpParolaAnimate();
       // Parola rewrites every zone; put the name pixels back after number anims.
       if (slot == AnimSlot::Num) restoreNameBlit();
       pollDuringAnim();
     }
+    endParolaPump();
     if (slot == AnimSlot::Num) restoreNameBlit();
     return animCurrent(slot, gen);
   }
@@ -911,6 +1506,51 @@ namespace {
     if (!animCurrent(slot, gen)) return false;
 
     const uint8_t resolved = resolveEffect(effect);
+    if (ShowMode::isLaserVert(resolved)) {
+      // Number-only (inc/dec) or name-only single-zone boards.
+      const uint32_t nameGen = (slot == AnimSlot::Name) ? gen : nameAnimGen;
+      const uint32_t numGen = (slot == AnimSlot::Num) ? gen : numAnimGen;
+      const int8_t nz =
+          (slot == AnimSlot::Name) ? static_cast<int8_t>(zone) : static_cast<int8_t>(-1);
+      const int8_t cz =
+          (slot == AnimSlot::Num) ? static_cast<int8_t>(zone) : static_cast<int8_t>(-1);
+      if (!laserVertWipeZones(nz, (slot == AnimSlot::Name) ? text : nullptr, cz,
+                              (slot == AnimSlot::Num) ? text : nullptr,
+                              resolved == ShowMode::LASER_UP, true, nameGen, numGen)) {
+        return false;
+      }
+      if (slot == AnimSlot::Num) restoreNameBlit();
+      return animCurrent(slot, gen);
+    }
+    if (resolved == ShowMode::PILING) {
+      const uint32_t nameGen = (slot == AnimSlot::Name) ? gen : nameAnimGen;
+      const uint32_t numGen = (slot == AnimSlot::Num) ? gen : numAnimGen;
+      const int8_t nz =
+          (slot == AnimSlot::Name) ? static_cast<int8_t>(zone) : static_cast<int8_t>(-1);
+      const int8_t cz =
+          (slot == AnimSlot::Num) ? static_cast<int8_t>(zone) : static_cast<int8_t>(-1);
+      if (!pilingSandZones(nz, (slot == AnimSlot::Name) ? text : nullptr, cz,
+                           (slot == AnimSlot::Num) ? text : nullptr, true, nameGen, numGen)) {
+        return false;
+      }
+      if (slot == AnimSlot::Num) restoreNameBlit();
+      return animCurrent(slot, gen);
+    }
+    if (resolved == ShowMode::ANIMATION) {
+      const uint32_t nameGen = (slot == AnimSlot::Name) ? gen : nameAnimGen;
+      const uint32_t numGen = (slot == AnimSlot::Num) ? gen : numAnimGen;
+      const int8_t nz =
+          (slot == AnimSlot::Name) ? static_cast<int8_t>(zone) : static_cast<int8_t>(-1);
+      const int8_t cz =
+          (slot == AnimSlot::Num) ? static_cast<int8_t>(zone) : static_cast<int8_t>(-1);
+      if (!animationRandomZones(nz, (slot == AnimSlot::Name) ? text : nullptr, cz,
+                                (slot == AnimSlot::Num) ? text : nullptr, true, nameGen,
+                                numGen)) {
+        return false;
+      }
+      if (slot == AnimSlot::Num) restoreNameBlit();
+      return animCurrent(slot, gen);
+    }
     const textEffect_t inEff = toParolaEffect(resolved);
     if (inEff == PA_PRINT) {
       board->displayClear(zone);
@@ -927,9 +1567,9 @@ namespace {
     }
     uint16_t spd = parolaScrollSpeed(speed);
     if (resolved == ShowMode::ANIMATION) {
-      spd = 6;
+      spd = 0;  // pump bursts pixels; tick unused
     }
-    return runZoneAnim(zone, text, inEff, PA_NO_EFFECT, spd, pauseMs, gen, slot);
+    return runZoneAnim(zone, text, inEff, PA_NO_EFFECT, spd, pauseMs, gen, slot, resolved);
   }
 
   void playBootAnimation() {
@@ -1023,11 +1663,12 @@ namespace {
     return runEffectAnim(z, numBuf, effect, 35, 80, gen, AnimSlot::Num);
   }
 
-  void runCounterEnterAnim(uint8_t effect) {
+  void runCounterEnterAnim(uint8_t effect, uint8_t speed) {
     board->displayShutdown(false);
     board->setIntensity(effectiveIntensity());
 
     const uint8_t eff = resolveEffect(effect);
+    useEffectSpeed(eff, speed);
     const int8_t nz = nameZoneId();
     const int8_t cz = numberZone();
     const Counter& c = Counters::getConst(Counters::activeIndex());
@@ -1055,28 +1696,211 @@ namespace {
     }
   }
 
-  void runCountIncAnim(int32_t newCount, uint8_t effect) {
+  void runCountIncAnim(int32_t newCount, uint8_t effect, uint8_t speed) {
     board->displayShutdown(false);
     board->setIntensity(effectiveIntensity());
     paintNameOnly();
     const uint32_t gen = beginAnim(AnimSlot::Num);
+    const uint8_t eff = resolveEffect(effect);
+    useEffectSpeed(eff, speed);
     bool ok;
     if (isMilestone(newCount)) {
       ok = playFireworks(newCount, gen);
     } else {
-      ok = playCountAnim(newCount, resolveEffect(effect), gen);
+      ok = playCountAnim(newCount, eff, gen);
     }
     if (ok) restoreBlankAfterAnim();
   }
 
-  void runCountDecAnim(int32_t newCount, uint8_t effect) {
+  void runCountDecAnim(int32_t newCount, uint8_t effect, uint8_t speed) {
     board->displayShutdown(false);
     board->setIntensity(effectiveIntensity());
     paintNameOnly();
     const uint32_t gen = beginAnim(AnimSlot::Num);
-    if (playCountAnim(newCount, resolveEffect(effect), gen)) {
+    const uint8_t eff = resolveEffect(effect);
+    useEffectSpeed(eff, speed);
+    if (playCountAnim(newCount, eff, gen)) {
       restoreBlankAfterAnim();
     }
+  }
+
+  void clearScrollerCycle() {
+    scrollerCycleAll = false;
+    scrollerHolding = false;
+    scrollerAdvancing = false;
+  }
+
+  int8_t nextNonEmptyScrollMsg(uint8_t from) {
+    const uint8_t n = Counters::scrollMessageCount();
+    if (n == 0) return -1;
+    for (uint8_t step = 0; step < n; step++) {
+      const uint8_t i = static_cast<uint8_t>((from + step) % n);
+      const char* msg = Counters::scrollMessage(i);
+      if (msg && msg[0]) return static_cast<int8_t>(i);
+    }
+    return -1;
+  }
+
+  void fillScrollerBuffers(uint8_t msgIdx) {
+    const char* msg = Counters::scrollMessage(msgIdx);
+    if (msg && msg[0]) {
+      strncpy(scrollerBuf, msg, SCROLLER_MAX_LEN);
+      scrollerBuf[SCROLLER_MAX_LEN] = '\0';
+    } else {
+      strncpy(scrollerBuf, " ", sizeof(scrollerBuf));
+    }
+    const char* bot = Counters::scrollMessageBottom(msgIdx);
+    if (bot && bot[0]) {
+      strncpy(scrollerBottomBuf, bot, SCROLLER_BOTTOM_MAX_LEN);
+      scrollerBottomBuf[SCROLLER_BOTTOM_MAX_LEN] = '\0';
+    } else {
+      scrollerBottomBuf[0] = '\0';
+    }
+  }
+
+  void setScrollerDirs(uint8_t effectIn) {
+    const uint8_t resolvedIn = resolveEffect(effectIn);
+    useMarqueeSpeed();
+    const bool wantLeft = (resolvedIn != ShowMode::RIGHT);
+    bool nameParolaRight = !wantLeft;
+    if (NAME_ZONE_FLIP_LR) nameParolaRight = !nameParolaRight;
+    scrollerDir = nameParolaRight ? PA_SCROLL_RIGHT : PA_SCROLL_LEFT;
+    scrollerBottomDir = wantLeft ? PA_SCROLL_LEFT : PA_SCROLL_RIGHT;
+  }
+
+  // Assumes scrollerBuf / bottom / dirs already set.
+  bool armScrollerMarquee() {
+    const int8_t nz = nameZoneId();
+    const int8_t cz = numberZone();
+    if (nz < 0) return false;
+
+    scrollerZone = static_cast<uint8_t>(nz);
+    scrollerHasBottom = (cz >= 0 && scrollerBottomBuf[0]);
+    scrollerBottomZone = scrollerHasBottom ? static_cast<uint8_t>(cz) : 0;
+
+    uint8_t fitBuf[NAME_COL_BUF];
+    const uint16_t topCols = buildNameColumns(scrollerBuf, fitBuf, NAME_COL_BUF);
+    const uint16_t topZoneCols = zoneWidthCols(scrollerZone);
+    scrollerTopScrolls = (topCols > topZoneCols);
+
+    scrollerBottomScrolls = false;
+    if (scrollerHasBottom) {
+      uint8_t botFit[64];
+      const uint16_t botCols = buildNameColumns(scrollerBottomBuf, botFit, sizeof(botFit));
+      const uint16_t botZoneCols = zoneWidthCols(scrollerBottomZone);
+      scrollerBottomScrolls = (botCols > botZoneCols);
+    }
+
+    scrollerOn = true;
+    scrollerHolding = false;
+    scrollerTopPassLatched = !scrollerTopScrolls;
+    scrollerBotPassLatched = !scrollerBottomScrolls;
+    scrollerPassDone = scrollerTopPassLatched && scrollerBotPassLatched;
+
+    board->displayShutdown(false);
+    board->setIntensity(effectiveIntensity());
+    board->displayClear();
+
+    const uint16_t spd = parolaScrollSpeed(40);
+    board->setCharSpacing(scrollerZone, 1);
+    if (scrollerTopScrolls) {
+      board->displayZoneText(scrollerZone, scrollerBuf, PA_LEFT, spd, 0, scrollerDir,
+                             scrollerDir);
+    } else {
+      board->displayZoneText(scrollerZone, scrollerBuf, PA_CENTER, 0, 0, PA_PRINT,
+                             PA_NO_EFFECT);
+    }
+    board->displayReset(scrollerZone);
+
+    if (cz >= 0) {
+      board->displayClear(cz);
+      if (scrollerHasBottom) {
+        board->setCharSpacing(scrollerBottomZone, 1);
+        if (scrollerBottomScrolls) {
+          board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_LEFT, spd, 0,
+                                 scrollerBottomDir, scrollerBottomDir);
+        } else {
+          board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_CENTER, 0, 0,
+                                 PA_PRINT, PA_NO_EFFECT);
+        }
+        board->displayReset(scrollerBottomZone);
+      }
+    }
+    return true;
+  }
+
+  void restartScrollerPass() {
+    scrollerTopPassLatched = !scrollerTopScrolls;
+    scrollerBotPassLatched = !scrollerBottomScrolls;
+    scrollerPassDone = false;
+    scrollerHolding = false;
+    const uint16_t spd = parolaScrollSpeed(40);
+    if (scrollerTopScrolls) {
+      board->displayClear(scrollerZone);
+      board->setCharSpacing(scrollerZone, 1);
+      board->displayZoneText(scrollerZone, scrollerBuf, PA_LEFT, spd, 0, scrollerDir,
+                             scrollerDir);
+      board->displayReset(scrollerZone);
+    }
+    if (scrollerBottomScrolls && scrollerHasBottom) {
+      board->displayClear(scrollerBottomZone);
+      board->setCharSpacing(scrollerBottomZone, 1);
+      board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_LEFT, spd, 0,
+                             scrollerBottomDir, scrollerBottomDir);
+      board->displayReset(scrollerBottomZone);
+    }
+  }
+
+  void advanceScrollerCycle() {
+    if (!scrollerCycleAll || scrollerAdvancing || !board) return;
+    scrollerAdvancing = true;
+
+    const uint8_t n = Counters::scrollMessageCount();
+    int8_t next = (n > 0)
+                      ? nextNonEmptyScrollMsg(
+                            static_cast<uint8_t>((scrollerCycleIdx + 1) % n))
+                      : static_cast<int8_t>(-1);
+    if (next < 0) {
+      scrollerAdvancing = false;
+      return;
+    }
+
+    // Sole scrolling message: loop the same marquee pass.
+    if (static_cast<uint8_t>(next) == scrollerCycleIdx &&
+        (scrollerTopScrolls || scrollerBottomScrolls)) {
+      restartScrollerPass();
+      scrollerAdvancing = false;
+      return;
+    }
+    // Sole static message: leave it up until the user stops.
+    if (static_cast<uint8_t>(next) == scrollerCycleIdx) {
+      scrollerAdvancing = false;
+      return;
+    }
+
+    const bool fromScroller = scrollerOn;
+    scrollerOn = false;
+    scrollerTopScrolls = false;
+    scrollerBottomScrolls = false;
+    stopNameTeeter();
+    nameStaticValid = false;
+    const uint32_t nameGen = beginAnim(AnimSlot::Name);
+    const uint32_t numGen = beginAnim(AnimSlot::Num);
+    const uint8_t resolvedOut = resolveEffect(scrollerCycleOutEff);
+    useEffectSpeed(resolvedOut, scrollerCycleSpeed);
+    if (!scrollDisplayedOff(resolvedOut, nameGen, numGen, fromScroller)) {
+      clearScrollerCycle();
+      scrollerAdvancing = false;
+      return;
+    }
+
+    scrollerCycleIdx = static_cast<uint8_t>(next);
+    fillScrollerBuffers(scrollerCycleIdx);
+    setScrollerDirs(scrollerCycleInEff);
+    if (!armScrollerMarquee()) {
+      clearScrollerCycle();
+    }
+    scrollerAdvancing = false;
   }
 
   void drainPendingAnims() {
@@ -1086,13 +1910,13 @@ namespace {
       animBusy = true;
       switch (job.kind) {
         case PendingKind::CounterEnter:
-          runCounterEnterAnim(job.effect);
+          runCounterEnterAnim(job.effect, job.speed);
           break;
         case PendingKind::CountInc:
-          runCountIncAnim(job.count, job.effect);
+          runCountIncAnim(job.count, job.effect, job.speed);
           break;
         case PendingKind::CountDec:
-          runCountDecAnim(job.count, job.effect);
+          runCountDecAnim(job.count, job.effect, job.speed);
           break;
         default:
           break;
@@ -1167,6 +1991,23 @@ void loop() {
     } else {
       scrollerPassDone = true;
     }
+
+    // Night / web Start: rotate through all messages until toggled off.
+    if (scrollerCycleAll && scrollerPassDone && !scrollerAdvancing) {
+      const bool needsHold = !scrollerTopScrolls && !scrollerBottomScrolls;
+      if (needsHold) {
+        if (!scrollerHolding) {
+          scrollerHolding = true;
+          scrollerHoldStartMs = millis();
+        }
+        const uint32_t holdMs =
+            static_cast<uint32_t>(Counters::idleCycleSeconds()) * 1000UL;
+        if (static_cast<uint32_t>(millis() - scrollerHoldStartMs) < holdMs) {
+          return;
+        }
+      }
+      advanceScrollerCycle();
+    }
     return;
   }
 
@@ -1210,7 +2051,7 @@ void flashActive(uint8_t /*index*/) {
   flashUntil = millis() + 250;
 }
 
-void onCountIncreased(int32_t newCount, uint8_t effect) {
+void onCountIncreased(int32_t newCount, uint8_t effect, uint8_t speed) {
   scrollerOn = false;
   if (!inited || !board || !displayVisible()) {
     applyBlankState();
@@ -1219,13 +2060,14 @@ void onCountIncreased(int32_t newCount, uint8_t effect) {
 
   pendingAnim.kind = PendingKind::CountInc;
   pendingAnim.effect = effect;
+  pendingAnim.speed = speed;
   pendingAnim.count = newCount;
   cancelInFlightAnims();
   if (animBusy) return;
   drainPendingAnims();
 }
 
-void onCountDecreased(int32_t newCount, uint8_t effect) {
+void onCountDecreased(int32_t newCount, uint8_t effect, uint8_t speed) {
   scrollerOn = false;
   if (!inited || !board || !displayVisible()) {
     applyBlankState();
@@ -1234,13 +2076,14 @@ void onCountDecreased(int32_t newCount, uint8_t effect) {
 
   pendingAnim.kind = PendingKind::CountDec;
   pendingAnim.effect = effect;
+  pendingAnim.speed = speed;
   pendingAnim.count = newCount;
   cancelInFlightAnims();
   if (animBusy) return;
   drainPendingAnims();
 }
 
-void idleShowNext(int32_t /*count*/, uint8_t effect) {
+void idleShowNext(int32_t /*count*/, uint8_t effect, uint8_t speed) {
   // Soft-stop marquee flag; preferred path animates off before calling this.
   scrollerOn = false;
   scrollerPassDone = false;
@@ -1253,14 +2096,15 @@ void idleShowNext(int32_t /*count*/, uint8_t effect) {
 
   pendingAnim.kind = PendingKind::CounterEnter;
   pendingAnim.effect = effect;
+  pendingAnim.speed = speed;
   pendingAnim.count = 0;
   cancelInFlightAnims();
   if (animBusy) return;
   drainPendingAnims();
 }
 
-void selectShow(uint8_t effect) {
-  idleShowNext(0, effect);
+void selectShow(uint8_t effect, uint8_t speed) {
+  idleShowNext(0, effect, speed);
 }
 
 bool scrollerActive() { return scrollerOn; }
@@ -1269,6 +2113,7 @@ bool scrollerCompletedPass() { return scrollerPassDone; }
 
 // Halt marquee and leave Parola zones idle so loop() won't keep scrolling.
 void haltScrollerEngine() {
+  clearScrollerCycle();
   scrollerOn = false;
   scrollerPassDone = false;
   scrollerTopScrolls = false;
@@ -1308,10 +2153,11 @@ void stopManualScroller(bool restore) {
   if (restore) applyBlankState();
 }
 
-bool animateDisplayedOff(uint8_t effect) {
+bool animateDisplayedOff(uint8_t effect, uint8_t speed) {
   if (!inited || !board) return false;
   const bool fromScroller = scrollerOn;
   // Stop marquee engine; scroller exit must not reprint text.
+  clearScrollerCycle();
   scrollerOn = false;
   scrollerPassDone = false;
   scrollerTopScrolls = false;
@@ -1321,18 +2167,23 @@ bool animateDisplayedOff(uint8_t effect) {
   const uint32_t nameGen = beginAnim(AnimSlot::Name);
   const uint32_t numGen = beginAnim(AnimSlot::Num);
   const uint8_t resolved = resolveEffect(effect);
+  useEffectSpeed(resolved, speed);
   if (!scrollDisplayedOff(resolved, nameGen, numGen, fromScroller)) return false;
   board->displayClear();
   return true;
 }
 
 void startManualScroller(uint8_t effectIn, const char* text, const char* bottom,
-                         uint8_t effectOut) {
+                         uint8_t effectOut, uint8_t speed) {
   if (!inited || !board) return;
   if (!displayVisible()) {
     applyBlankState();
     return;
   }
+
+  // nullptr text → Night / web Start: cycle every non-empty scrollMessage.
+  // Explicit text → idle playlist one-shot for that message.
+  const bool cycleAll = (text == nullptr);
 
   const bool fromScroller = scrollerOn;
   // Keep current content for exit; only stop the marquee flag so loop won't fight us.
@@ -1345,90 +2196,46 @@ void startManualScroller(uint8_t effectIn, const char* text, const char* bottom,
   const uint32_t numGen = beginAnim(AnimSlot::Num);
 
   const uint8_t resolvedOut = resolveEffect(effectOut);
+  useEffectSpeed(resolvedOut, speed);
 
   // Exit previous content (scroller never reprints — that flashed text after scroll-off).
   if (!scrollDisplayedOff(resolvedOut, nameGen, numGen, fromScroller)) {
+    clearScrollerCycle();
     return;
   }
 
-  const char* msg = text ? text : Counters::scrollMessage();
-  if (msg && msg[0]) {
-    strncpy(scrollerBuf, msg, SCROLLER_MAX_LEN);
-    scrollerBuf[SCROLLER_MAX_LEN] = '\0';
-  } else {
-    strncpy(scrollerBuf, " ", sizeof(scrollerBuf));
-  }
-
-  const char* bot = bottom;
-  if (!bot && !text) bot = Counters::scrollMessageBottom(0);
-  if (bot && bot[0]) {
-    strncpy(scrollerBottomBuf, bot, SCROLLER_BOTTOM_MAX_LEN);
-    scrollerBottomBuf[SCROLLER_BOTTOM_MAX_LEN] = '\0';
-  } else {
-    scrollerBottomBuf[0] = '\0';
-  }
-
-  const uint8_t resolvedIn = resolveEffect(effectIn);
-  const bool wantLeft = (resolvedIn != ShowMode::RIGHT);
-  // Name zone is LR-flipped; number zone is not — use matching visual directions.
-  bool nameParolaRight = !wantLeft;
-  if (NAME_ZONE_FLIP_LR) nameParolaRight = !nameParolaRight;
-  scrollerDir = nameParolaRight ? PA_SCROLL_RIGHT : PA_SCROLL_LEFT;
-  scrollerBottomDir = wantLeft ? PA_SCROLL_LEFT : PA_SCROLL_RIGHT;
-
-  const int8_t nz = nameZoneId();
-  const int8_t cz = numberZone();
-  if (nz < 0) return;
-
-  scrollerZone = static_cast<uint8_t>(nz);
-  scrollerHasBottom = (cz >= 0 && scrollerBottomBuf[0]);
-  scrollerBottomZone = scrollerHasBottom ? static_cast<uint8_t>(cz) : 0;
-
-  // Scroll only when text does not fit the zone width.
-  uint8_t fitBuf[NAME_COL_BUF];
-  const uint16_t topCols = buildNameColumns(scrollerBuf, fitBuf, NAME_COL_BUF);
-  const uint16_t topZoneCols = zoneWidthCols(scrollerZone);
-  scrollerTopScrolls = (topCols > topZoneCols);
-
-  scrollerBottomScrolls = false;
-  if (scrollerHasBottom) {
-    uint8_t botFit[64];
-    const uint16_t botCols = buildNameColumns(scrollerBottomBuf, botFit, sizeof(botFit));
-    const uint16_t botZoneCols = zoneWidthCols(scrollerBottomZone);
-    scrollerBottomScrolls = (botCols > botZoneCols);
-  }
-
-  scrollerOn = true;
-  scrollerTopPassLatched = !scrollerTopScrolls;  // static = already "done"
-  scrollerBotPassLatched = !scrollerBottomScrolls;
-  scrollerPassDone = scrollerTopPassLatched && scrollerBotPassLatched;
-
-  board->displayShutdown(false);
-  board->setIntensity(effectiveIntensity());
-  board->displayClear();
-
-  const uint16_t spd = parolaScrollSpeed(40);
-  board->setCharSpacing(scrollerZone, 1);
-  if (scrollerTopScrolls) {
-    board->displayZoneText(scrollerZone, scrollerBuf, PA_LEFT, spd, 0, scrollerDir, scrollerDir);
-  } else {
-    board->displayZoneText(scrollerZone, scrollerBuf, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
-  }
-  board->displayReset(scrollerZone);
-
-  if (cz >= 0) {
-    board->displayClear(cz);
-    if (scrollerHasBottom) {
-      board->setCharSpacing(scrollerBottomZone, 1);
-      if (scrollerBottomScrolls) {
-        board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_LEFT, spd, 0,
-                               scrollerBottomDir, scrollerBottomDir);
-      } else {
-        board->displayZoneText(scrollerBottomZone, scrollerBottomBuf, PA_CENTER, 0, 0,
-                               PA_PRINT, PA_NO_EFFECT);
-      }
-      board->displayReset(scrollerBottomZone);
+  if (cycleAll) {
+    const int8_t first = nextNonEmptyScrollMsg(0);
+    if (first < 0) {
+      clearScrollerCycle();
+      board->displayClear();
+      return;
     }
+    scrollerCycleAll = true;
+    scrollerCycleIdx = static_cast<uint8_t>(first);
+    scrollerCycleInEff = effectIn;
+    scrollerCycleOutEff = effectOut;
+    scrollerCycleSpeed = speed;
+    fillScrollerBuffers(scrollerCycleIdx);
+  } else {
+    clearScrollerCycle();
+    if (text[0]) {
+      strncpy(scrollerBuf, text, SCROLLER_MAX_LEN);
+      scrollerBuf[SCROLLER_MAX_LEN] = '\0';
+    } else {
+      strncpy(scrollerBuf, " ", sizeof(scrollerBuf));
+    }
+    if (bottom && bottom[0]) {
+      strncpy(scrollerBottomBuf, bottom, SCROLLER_BOTTOM_MAX_LEN);
+      scrollerBottomBuf[SCROLLER_BOTTOM_MAX_LEN] = '\0';
+    } else {
+      scrollerBottomBuf[0] = '\0';
+    }
+  }
+
+  setScrollerDirs(effectIn);
+  if (!armScrollerMarquee()) {
+    clearScrollerCycle();
   }
 }
 
