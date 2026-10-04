@@ -2,7 +2,6 @@
 #include "counters.h"
 #include "show_mode.h"
 #include "wiz_remote.h"
-#include "local_buttons.h"
 #include "remote_map.h"
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
@@ -41,10 +40,31 @@ namespace {
     return gen == ((slot == AnimSlot::Name) ? nameAnimGen : numAnimGen);
   }
 
+  // Prevent remote handlers from nesting another blocking anim (stack overflow on C3).
+  bool pollingInputs = false;
+  bool animBusy = false;
+
+  enum class PendingKind : uint8_t { None, CounterEnter, CountInc, CountDec };
+  struct PendingAnim {
+    PendingKind kind = PendingKind::None;
+    uint8_t effect = 0;
+    int32_t count = 0;
+  } pendingAnim;
+
+  void cancelInFlightAnims() {
+    beginAnim(AnimSlot::Name);
+    beginAnim(AnimSlot::Num);
+  }
+
   void pollDuringAnim() {
+    if (pollingInputs) {
+      yield();
+      return;
+    }
+    pollingInputs = true;
     WizRemote::loop();
-    LocalButtons::loop();
     RemoteMap::loop();
+    pollingInputs = false;
     yield();
   }
 
@@ -126,22 +146,21 @@ namespace {
     return static_cast<uint16_t>(90 - (s * 7));
   }
 
-  // Transition scroll: frame delay (lower = faster)
+  // Transition scroll: ms between column steps (lower = faster overall)
   uint16_t transitionFrameMs() {
     uint8_t s = Counters::scrollSpeed();
     if (s < 1) s = 1;
     if (s > 10) s = 10;
-    // ~18ms at 1 → ~3ms at 10
-    return static_cast<uint16_t>(20 - s);
+    // ~26ms at 1 → ~8ms at 10
+    return static_cast<uint16_t>(28 - ((s - 1) * 20) / 9);
   }
 
-  // Columns advanced per transition frame (snappy even on 64-col zones)
-  uint8_t transitionStepCols() {
+  // Horizontal scroll progress per frame: 1 at speed 1 → 3 at speed 10 (up to 3×)
+  uint8_t transitionStride() {
     uint8_t s = Counters::scrollSpeed();
     if (s < 1) s = 1;
     if (s > 10) s = 10;
-    // 2 at speed 1 → 8 at speed 10
-    return static_cast<uint8_t>(1 + s);
+    return static_cast<uint8_t>(1 + ((s - 1) * 2) / 9);
   }
 
   // Parola effect speed (lower = faster); scale with scrollSpeed (transitions)
@@ -149,9 +168,10 @@ namespace {
     uint8_t s = Counters::scrollSpeed();
     if (s < 1) s = 1;
     if (s > 10) s = 10;
-    const int scaled = static_cast<int>(base) * 5 / static_cast<int>(s);
-    if (scaled < 4) return 4;
-    if (scaled > 60) return 60;
+    // Gentler than linear: keep mid speeds from feeling rushed
+    const int scaled = (static_cast<int>(base) * 6) / static_cast<int>(s);
+    if (scaled < 6) return 6;
+    if (scaled > 80) return 80;
     return static_cast<uint16_t>(scaled);
   }
 
@@ -200,8 +220,7 @@ namespace {
   bool runEffectAnim(uint8_t zone, const char* text, uint8_t effect,
                      uint16_t speed, uint16_t pauseMs, uint32_t gen, AnimSlot slot);
 
-  // Build column buffer: 1px between letters; no extra gaps around spaces
-  // (space glyph alone is the word gap). "CAPTAIN JACK" → 64 cols on 8 modules.
+  // Build column buffer with 1px between glyphs (including spaces).
   uint16_t buildNameColumns(const char* text, uint8_t* out, uint16_t outMax) {
     MD_MAX72XX* mx = board->getGraphicObject();
     if (!mx || !text || !out || outMax == 0) return 0;
@@ -215,8 +234,7 @@ namespace {
       for (uint8_t c = 0; c < w && n < outMax; c++) {
         out[n++] = glyph[c];
       }
-      // Letter spacing only between two non-space glyphs
-      if (i + 1 < len && text[i] != ' ' && text[i + 1] != ' ' && n < outMax) {
+      if (i + 1 < len && n < outMax) {
         out[n++] = 0;
       }
     }
@@ -224,19 +242,146 @@ namespace {
   }
 
   // origin = source column of the leftmost visible pixel (negative pads left).
-  void blitNameWindow(uint8_t /*zone*/, uint16_t zoneStart, uint16_t zoneCols,
-                      const uint8_t* colBuf, uint16_t textCols, int16_t origin) {
+  // doUpdate=false to batch multiple zone blits before one mx->update().
+  void blitZoneColumns(uint16_t zoneStart, uint16_t zoneCols, const uint8_t* colBuf,
+                       uint16_t textCols, int16_t origin, bool flipLR, bool flipUD,
+                       bool doUpdate) {
     MD_MAX72XX* mx = board->getGraphicObject();
     if (!mx || zoneCols == 0) return;
 
     const uint16_t zoneEnd = zoneStart + zoneCols - 1;
     for (uint16_t i = 0; i < zoneCols; i++) {
+      const uint16_t destI = flipLR ? (zoneCols - 1 - i) : i;
       const int32_t src = static_cast<int32_t>(origin) + static_cast<int32_t>(i);
-      const uint8_t v =
+      uint8_t v =
           (src >= 0 && src < static_cast<int32_t>(textCols)) ? colBuf[src] : 0;
-      mx->setColumn(zoneEnd - i, v);
+      if (flipUD) {
+        v = static_cast<uint8_t>(((v * 0x0802u & 0x22110u) | (v * 0x8020u & 0x88440u)) * 0x10101u >> 16);
+      }
+      mx->setColumn(zoneEnd - destI, v);
     }
-    mx->update();
+    if (doUpdate) mx->update();
+  }
+
+  void blitNameWindow(uint8_t /*zone*/, uint16_t zoneStart, uint16_t zoneCols,
+                      const uint8_t* colBuf, uint16_t textCols, int16_t origin) {
+    blitZoneColumns(zoneStart, zoneCols, colBuf, textCols, origin,
+                    NAME_ZONE_FLIP_LR, NAME_ZONE_FLIP_UD, true);
+  }
+
+  // Capture zone columns in the same logical order blitZoneColumns uses.
+  void snapshotZone(uint16_t zoneStart, uint16_t zoneCols, uint8_t* out, bool flipLR) {
+    MD_MAX72XX* mx = board->getGraphicObject();
+    if (!mx || zoneCols == 0 || !out) return;
+    const uint16_t zoneEnd = zoneStart + zoneCols - 1;
+    for (uint16_t i = 0; i < zoneCols; i++) {
+      const uint16_t destI = flipLR ? (zoneCols - 1 - i) : i;
+      out[i] = mx->getColumn(zoneEnd - destI);
+    }
+  }
+
+  // Push: old and new share one origin timeline (incoming replaces outgoing).
+  void blitZonePush(uint16_t zoneStart, uint16_t zoneCols,
+                    const uint8_t* oldBuf, uint16_t oldCols, int16_t oldOrigin,
+                    const uint8_t* newBuf, uint16_t newCols, int16_t newOrigin,
+                    bool flipLR, bool flipUD, bool doUpdate) {
+    MD_MAX72XX* mx = board->getGraphicObject();
+    if (!mx || zoneCols == 0) return;
+    const uint16_t zoneEnd = zoneStart + zoneCols - 1;
+    for (uint16_t i = 0; i < zoneCols; i++) {
+      const uint16_t destI = flipLR ? (zoneCols - 1 - i) : i;
+      const int32_t srcN = static_cast<int32_t>(newOrigin) + static_cast<int32_t>(i);
+      const int32_t srcO = static_cast<int32_t>(oldOrigin) + static_cast<int32_t>(i);
+      uint8_t v = 0;
+      if (srcN >= 0 && srcN < static_cast<int32_t>(newCols) && newBuf) {
+        v = newBuf[srcN];
+        if (flipUD) {
+          v = static_cast<uint8_t>(((v * 0x0802u & 0x22110u) | (v * 0x8020u & 0x88440u)) * 0x10101u >> 16);
+        }
+      } else if (srcO >= 0 && srcO < static_cast<int32_t>(oldCols) && oldBuf) {
+        v = oldBuf[srcO];  // already on-screen orientation
+      }
+      mx->setColumn(zoneEnd - destI, v);
+    }
+    if (doUpdate) mx->update();
+  }
+
+  // Scroll whatever is currently displayed off-panel (used by manual scroller start).
+  bool scrollDisplayedOff(bool slideLeft, uint32_t nameGen, uint32_t numGen) {
+    const int8_t nz = nameZoneId();
+    const int8_t cz = numberZone();
+    if (nz < 0 && cz < 0) return true;
+
+    uint16_t nStart = 0, nEnd = 0, zStart = 0, zEnd = 0;
+    uint16_t zCols = 0, nCols = 0;
+    uint8_t nameSnap[MODULES_NAME * COLS_PER_MOD];
+    uint8_t numSnap[MODULES_NUMBER * COLS_PER_MOD];
+
+    if (nz >= 0) {
+      board->getDisplayExtent(static_cast<uint8_t>(nz), zStart, zEnd);
+      zCols = zoneWidthCols(static_cast<uint8_t>(nz));
+      if (zCols > sizeof(nameSnap)) zCols = sizeof(nameSnap);
+      snapshotZone(zStart, zCols, nameSnap, NAME_ZONE_FLIP_LR);
+    }
+    if (cz >= 0) {
+      board->getDisplayExtent(static_cast<uint8_t>(cz), nStart, nEnd);
+      nCols = zoneWidthCols(static_cast<uint8_t>(cz));
+      if (nCols > sizeof(numSnap)) nCols = sizeof(numSnap);
+      snapshotZone(nStart, nCols, numSnap, false);
+    }
+
+    const int16_t nameFrom = 0;
+    const int16_t nameTo =
+        slideLeft ? static_cast<int16_t>(zCols) : static_cast<int16_t>(-static_cast<int16_t>(zCols));
+    const int16_t numFrom = 0;
+    const int16_t numTo =
+        slideLeft ? static_cast<int16_t>(nCols) : static_cast<int16_t>(-static_cast<int16_t>(nCols));
+
+    const uint16_t nameDist =
+        (nz >= 0) ? static_cast<uint16_t>(nameFrom > nameTo ? (nameFrom - nameTo) : (nameTo - nameFrom))
+                  : 0;
+    const uint16_t numDist =
+        (cz >= 0) ? static_cast<uint16_t>(numFrom > numTo ? (numFrom - numTo) : (numTo - numFrom))
+                  : 0;
+    uint16_t frames = nameDist > numDist ? nameDist : numDist;
+    if (frames == 0) return true;
+
+    const uint16_t frameMs = transitionFrameMs();
+    const uint8_t stride = transitionStride();
+
+    auto stillOk = [&]() -> bool {
+      if (nz >= 0 && !animCurrent(AnimSlot::Name, nameGen)) return false;
+      if (cz >= 0 && !animCurrent(AnimSlot::Num, numGen)) return false;
+      return true;
+    };
+
+    auto lerpOrigin = [](int16_t a, int16_t b, uint16_t i, uint16_t n) -> int16_t {
+      if (n == 0) return b;
+      return static_cast<int16_t>(
+          a + (static_cast<int32_t>(b - a) * static_cast<int32_t>(i)) / static_cast<int32_t>(n));
+    };
+
+    for (uint16_t i = 0; i < frames; ) {
+      if (!stillOk()) return false;
+      uint16_t next = static_cast<uint16_t>(i + stride);
+      if (next > frames) next = frames;
+      i = next;
+      const int16_t oName = (nz >= 0) ? lerpOrigin(nameFrom, nameTo, i, frames) : 0;
+      const int16_t oNum = (cz >= 0) ? lerpOrigin(numFrom, numTo, i, frames) : 0;
+      if (nz >= 0) {
+        blitZonePush(zStart, zCols, nameSnap, zCols, oName, nullptr, 0, 0,
+                     NAME_ZONE_FLIP_LR, false, cz < 0);
+      }
+      if (cz >= 0) {
+        blitZonePush(nStart, nCols, numSnap, nCols, oNum, nullptr, 0, 0, false, false, true);
+      }
+      const uint32_t t0 = millis();
+      while (static_cast<uint32_t>(millis() - t0) < frameMs) {
+        if (!stillOk()) return false;
+        pollDuringAnim();
+      }
+    }
+    return stillOk();
   }
 
   void blitTeeterFrame() {
@@ -340,8 +485,8 @@ namespace {
     if (cz < 0 || !num) return true;
     if (!animCurrent(AnimSlot::Num, numGen)) return false;
     const textEffect_t inEff = toParolaEffect(resolved);
-    uint16_t spd = parolaScrollSpeed(30);
-    if (resolved == ShowMode::ANIMATION) spd = 4;
+    uint16_t spd = parolaScrollSpeed(40);
+    if (resolved == ShowMode::ANIMATION) spd = 6;
     board->setCharSpacing(cz, 1);
     board->displayClear(cz);
     if (inEff == PA_PRINT || resolved == ShowMode::FREEZE) {
@@ -365,7 +510,7 @@ namespace {
 
   // Name transitions: LEFT/RIGHT use column scroll (correct word gaps).
   // Other effects use Parola (or a fade), then settle via paintName.
-  // When numZone >= 0, number animates in parallel with the same effect.
+  // Dual LEFT/RIGHT: shared timeline — both center together (wide panel ≈ 2× travel).
   bool runNameInAnim(uint8_t z, const char* text, uint8_t effect, uint32_t gen,
                      int8_t numZone = -1, const char* numText = nullptr,
                      uint32_t numGen = 0) {
@@ -385,156 +530,239 @@ namespace {
     teeter.zoneCols = zCols;
     teeter.textCols = tCols;
 
-    const bool dual = (numZone >= 0);
+    const bool dual = (numZone >= 0 && numText);
 
-    auto dualStillOk = [&]() -> bool {
+    auto stillOk = [&]() -> bool {
       if (!animCurrent(AnimSlot::Name, gen)) return false;
       if (dual && !animCurrent(AnimSlot::Num, numGen)) return false;
       return true;
     };
 
-    auto fadeNameIn = [&](int16_t nameOrigin) -> bool {
-      const uint8_t target = effectiveIntensity();
+    auto lerpOrigin = [](int16_t a, int16_t b, uint16_t i, uint16_t n) -> int16_t {
+      if (n == 0) return b;
+      return static_cast<int16_t>(
+          a + (static_cast<int32_t>(b - a) * static_cast<int32_t>(i)) / static_cast<int32_t>(n));
+    };
+
+    // LEFT/RIGHT: old content exits while new content enters on one timeline.
+    auto scrollNameWithNumber = [&](int16_t from, int16_t to, int16_t /*step*/) -> bool {
+      const bool slideLeft = (to >= from);
+      const uint16_t frameMs = transitionFrameMs();
+
+      constexpr uint16_t NUM_COL_BUF = 64;
+      uint8_t numColBuf[NUM_COL_BUF];
+      uint8_t nameOld[MODULES_NAME * COLS_PER_MOD];
+      uint8_t numOld[MODULES_NUMBER * COLS_PER_MOD];
+
+      snapshotZone(startCol, zCols, nameOld, NAME_ZONE_FLIP_LR);
+
+      uint16_t nStart = 0, nEnd = 0;
+      uint16_t nZoneCols = 0;
+      uint16_t nTextCols = 0;
+      uint16_t nOldCols = 0;
+      int16_t nFrom = 0, nTo = 0;
+      int16_t nOldFrom = 0, nOldTo = 0;
+
       if (dual) {
-        board->setIntensity(0);
-      } else {
-        setNameModulesIntensity(0);
+        board->getDisplayExtent(static_cast<uint8_t>(numZone), nStart, nEnd);
+        nZoneCols = zoneWidthCols(static_cast<uint8_t>(numZone));
+        if (nZoneCols > sizeof(numOld)) nZoneCols = sizeof(numOld);
+        snapshotZone(nStart, nZoneCols, numOld, false);
+        nOldCols = nZoneCols;
+        nTextCols = buildNameColumns(numText, numColBuf, NUM_COL_BUF);
+        nTo = (nTextCols >= nZoneCols)
+                  ? 0
+                  : static_cast<int16_t>(
+                        -((static_cast<int16_t>(nZoneCols) - static_cast<int16_t>(nTextCols)) / 2));
+        nFrom = slideLeft ? static_cast<int16_t>(-static_cast<int16_t>(nZoneCols))
+                          : static_cast<int16_t>(nTextCols);
+        nOldFrom = 0;
+        nOldTo = slideLeft ? static_cast<int16_t>(nOldCols)
+                           : static_cast<int16_t>(-static_cast<int16_t>(nOldCols));
       }
-      const uint16_t frameMs = static_cast<uint16_t>(transitionFrameMs() + 4);
-      for (uint8_t i = 0; i <= target; i++) {
-        if (!dualStillOk()) return false;
-        if (dual) board->setIntensity(i);
-        else setNameModulesIntensity(i);
+
+      const int16_t oldFrom = 0;
+      const int16_t oldTo =
+          slideLeft ? static_cast<int16_t>(zCols) : static_cast<int16_t>(-static_cast<int16_t>(zCols));
+
+      // Duration follows the longer travel so both panels stay in sync.
+      const uint16_t nameDist = static_cast<uint16_t>(from > to ? (from - to) : (to - from));
+      const uint16_t nameOldDist =
+          static_cast<uint16_t>(oldFrom > oldTo ? (oldFrom - oldTo) : (oldTo - oldFrom));
+      const uint16_t numDist =
+          dual ? static_cast<uint16_t>(nFrom > nTo ? (nFrom - nTo) : (nTo - nFrom)) : 0;
+      const uint16_t numOldDist =
+          dual ? static_cast<uint16_t>(nOldFrom > nOldTo ? (nOldFrom - nOldTo) : (nOldTo - nOldFrom))
+               : 0;
+      uint16_t frames = nameDist;
+      if (nameOldDist > frames) frames = nameOldDist;
+      if (numDist > frames) frames = numDist;
+      if (numOldDist > frames) frames = numOldDist;
+      if (frames == 0) frames = 1;
+
+      auto blitBoth = [&](int16_t oldO, int16_t newO, int16_t nOldO, int16_t nNewO) {
+        blitZonePush(startCol, zCols, nameOld, zCols, oldO, teeter.colBuf, tCols, newO,
+                     NAME_ZONE_FLIP_LR, NAME_ZONE_FLIP_UD, !dual);
+        if (dual) {
+          blitZonePush(nStart, nZoneCols, numOld, nOldCols, nOldO, numColBuf, nTextCols, nNewO,
+                       false, false, true);
+        }
+      };
+
+      blitBoth(oldFrom, from, dual ? nOldFrom : 0, dual ? nFrom : 0);
+
+      const uint8_t stride = transitionStride();
+      for (uint16_t i = 0; i < frames; ) {
+        if (!stillOk()) return false;
+        uint16_t next = static_cast<uint16_t>(i + stride);
+        if (next > frames) next = frames;
+        i = next;
+        blitBoth(lerpOrigin(oldFrom, oldTo, i, frames), lerpOrigin(from, to, i, frames),
+                 dual ? lerpOrigin(nOldFrom, nOldTo, i, frames) : 0,
+                 dual ? lerpOrigin(nFrom, nTo, i, frames) : 0);
         const uint32_t t0 = millis();
         while (static_cast<uint32_t>(millis() - t0) < frameMs) {
-          if (!dualStillOk()) return false;
-          if (dual && !tickNumberKeepName(numZone, numGen, nameOrigin)) return false;
+          if (!stillOk()) return false;
+          pollDuringAnim();
+        }
+      }
+      return stillOk();
+    };
+
+    auto fadeNameWithNumber = [&](int16_t nameOrigin) -> bool {
+      const uint8_t target = effectiveIntensity();
+      const uint16_t frameMs = static_cast<uint16_t>(transitionFrameMs() + 4);
+      setNameModulesIntensity(0);
+      blitNameWindow(z, startCol, zCols, teeter.colBuf, tCols, nameOrigin);
+
+      // Number appears settled immediately — no Parola during name fade.
+      if (dual) {
+        constexpr uint16_t NUM_COL_BUF = 64;
+        uint8_t numColBuf[NUM_COL_BUF];
+        uint16_t nStart = 0, nEnd = 0;
+        board->getDisplayExtent(static_cast<uint8_t>(numZone), nStart, nEnd);
+        const uint16_t nZoneCols = zoneWidthCols(static_cast<uint8_t>(numZone));
+        const uint16_t nTextCols = buildNameColumns(numText, numColBuf, NUM_COL_BUF);
+        const int16_t nOrigin =
+            (nTextCols >= nZoneCols)
+                ? 0
+                : static_cast<int16_t>(
+                      -((static_cast<int16_t>(nZoneCols) - static_cast<int16_t>(nTextCols)) / 2));
+        blitZoneColumns(nStart, nZoneCols, numColBuf, nTextCols, nOrigin, false, false, true);
+      }
+
+      for (uint8_t level = 0; level <= target; level++) {
+        if (!stillOk()) return false;
+        setNameModulesIntensity(level);
+        const uint32_t t0 = millis();
+        while (static_cast<uint32_t>(millis() - t0) < frameMs) {
+          if (!stillOk()) return false;
           pollDuringAnim();
         }
       }
       board->setIntensity(effectiveIntensity());
-      return dualStillOk();
-    };
-
-    auto scrollNameTo = [&](int16_t from, int16_t to, int16_t step) -> bool {
-      const uint16_t frameMs = transitionFrameMs();
-      board->displayClear(z);
-      for (int16_t origin = from;;) {
-        if (!dualStillOk()) return false;
-        blitNameWindow(z, startCol, zCols, teeter.colBuf, tCols, origin);
-        if (dual && !tickNumberKeepName(numZone, numGen, origin)) return false;
-        if (origin == to) break;
-        int16_t next = static_cast<int16_t>(origin + step);
-        if (step > 0 && next > to) next = to;
-        if (step < 0 && next < to) next = to;
-        origin = next;
-        const uint32_t t0 = millis();
-        while (static_cast<uint32_t>(millis() - t0) < frameMs) {
-          if (!dualStillOk()) return false;
-          if (dual && !tickNumberKeepName(numZone, numGen, origin)) return false;
-          pollDuringAnim();
-        }
-      }
-      return dualStillOk();
-    };
-
-    auto settleNumber = [&](int16_t nameOrigin) -> bool {
-      if (!dual) return true;
-      return finishNumberKeepName(numZone, numGen, nameOrigin);
+      blitNameWindow(z, startCol, zCols, teeter.colBuf, tCols, nameOrigin);
+      return stillOk();
     };
 
     auto runDualParola = [&]() -> bool {
       const textEffect_t inEff = toParolaEffect(resolved);
-      uint16_t spd = parolaScrollSpeed(30);
-      if (resolved == ShowMode::ANIMATION) spd = 4;
+      uint16_t spd = parolaScrollSpeed(40);
+      if (resolved == ShowMode::ANIMATION) spd = 6;
       board->displayClear(z);
-      board->displayClear(numZone);
-      board->setCharSpacing(numZone, 1);
+      if (dual) board->displayClear(numZone);
+      if (dual) board->setCharSpacing(numZone, 1);
       board->displayZoneText(z, text, PA_CENTER, spd, 0, inEff, PA_NO_EFFECT);
-      board->displayZoneText(numZone, numText, PA_CENTER, spd, 0, inEff, PA_NO_EFFECT);
       board->displayReset(z);
-      board->displayReset(numZone);
-      while (!board->getZoneStatus(z) || !board->getZoneStatus(numZone)) {
-        if (!dualStillOk()) return false;
+      if (dual) {
+        board->displayZoneText(numZone, numText, PA_CENTER, spd, 0, inEff, PA_NO_EFFECT);
+        board->displayReset(numZone);
+      }
+      while (!board->getZoneStatus(z) || (dual && !board->getZoneStatus(numZone))) {
+        if (!stillOk()) return false;
         board->displayAnimate();
         pollDuringAnim();
       }
       paintName(z, text);
-      return dualStillOk();
+      return stillOk();
+    };
+
+    auto finishDual = [&](int16_t nameOrigin) -> bool {
+      nameStaticValid = true;
+      nameStaticOrigin = nameOrigin;
+      return stillOk();
+    };
+
+    auto paintNumberStatic = [&]() -> bool {
+      if (!dual) return true;
+      constexpr uint16_t NUM_COL_BUF = 64;
+      uint8_t numColBuf[NUM_COL_BUF];
+      uint16_t nStart = 0, nEnd = 0;
+      board->getDisplayExtent(static_cast<uint8_t>(numZone), nStart, nEnd);
+      const uint16_t nZoneCols = zoneWidthCols(static_cast<uint8_t>(numZone));
+      const uint16_t nTextCols = buildNameColumns(numText, numColBuf, NUM_COL_BUF);
+      const int16_t nOrigin =
+          (nTextCols >= nZoneCols)
+              ? 0
+              : static_cast<int16_t>(
+                    -((static_cast<int16_t>(nZoneCols) - static_cast<int16_t>(nTextCols)) / 2));
+      blitZoneColumns(nStart, nZoneCols, numColBuf, nTextCols, nOrigin, false, false, true);
+      return stillOk();
     };
 
     // Oversized names: transition into teeter start (offset 0), then bounce.
     if (tCols > zCols) {
       if (resolved == ShowMode::SMOTH) {
-        if (dual && !startNumberInAnim(numZone, numText, resolved, numGen)) return false;
-        blitNameWindow(z, startCol, zCols, teeter.colBuf, tCols, 0);
-        if (!fadeNameIn(0)) return false;
-        if (!settleNumber(0)) return false;
+        if (!fadeNameWithNumber(0)) return false;
+        if (!finishDual(0)) return false;
         startNameTeeter(z, text);
-        return dualStillOk();
+        return stillOk();
       }
       if (resolved == ShowMode::LEFT || resolved == ShowMode::RIGHT) {
-        if (dual && !startNumberInAnim(numZone, numText, resolved, numGen)) return false;
-        const int16_t stepCols = static_cast<int16_t>(transitionStepCols());
         int16_t from = static_cast<int16_t>(-static_cast<int16_t>(zCols));
-        int16_t step = stepCols;
+        int16_t step = 1;
         if (resolved == ShowMode::RIGHT) {
           from = static_cast<int16_t>(tCols);
-          step = static_cast<int16_t>(-stepCols);
+          step = -1;
         }
-        if (!scrollNameTo(from, 0, step)) return false;
-        if (!settleNumber(0)) return false;
+        if (!scrollNameWithNumber(from, 0, step)) return false;
+        if (!finishDual(0)) return false;
         startNameTeeter(z, text);
-        return dualStillOk();
+        return stillOk();
       }
-      if (dual) {
-        if (!runDualParola()) return false;
-      }
+      if (!runDualParola()) return false;
       startNameTeeter(z, text);
-      return dualStillOk();
+      return stillOk();
     }
 
     const int16_t finalOrigin = static_cast<int16_t>(
         -((static_cast<int16_t>(zCols) - static_cast<int16_t>(tCols)) / 2));
 
     if (resolved == ShowMode::FREEZE) {
-      if (dual && !startNumberInAnim(numZone, numText, resolved, numGen)) return false;
       paintNameStatic(z, teeter.colBuf, tCols);
-      return settleNumber(finalOrigin) && dualStillOk();
+      if (!paintNumberStatic()) return false;
+      return finishDual(finalOrigin);
     }
 
-    // Smooth = fade in name (+ whole board when number joins)
     if (resolved == ShowMode::SMOTH) {
-      if (dual && !startNumberInAnim(numZone, numText, resolved, numGen)) return false;
       board->displayClear(z);
-      blitNameWindow(z, startCol, zCols, teeter.colBuf, tCols, finalOrigin);
-      nameStaticValid = true;
-      nameStaticOrigin = finalOrigin;
-      if (!fadeNameIn(finalOrigin)) return false;
-      return settleNumber(finalOrigin) && dualStillOk();
+      if (!fadeNameWithNumber(finalOrigin)) return false;
+      return finishDual(finalOrigin);
     }
 
-    // Only Left/Right are horizontal scrolls
     if (resolved != ShowMode::LEFT && resolved != ShowMode::RIGHT) {
-      if (dual) return runDualParola();
-      if (!runEffectAnim(z, text, resolved, 30, 0, gen, AnimSlot::Name)) return false;
-      paintName(z, text);
-      return animCurrent(AnimSlot::Name, gen);
+      return runDualParola();
     }
 
-    if (dual && !startNumberInAnim(numZone, numText, resolved, numGen)) return false;
-    const int16_t stepCols = static_cast<int16_t>(transitionStepCols());
+    const int16_t stepCols = 1;
     int16_t from = static_cast<int16_t>(-static_cast<int16_t>(zCols));
     int16_t step = stepCols;
     if (resolved == ShowMode::RIGHT) {
       from = static_cast<int16_t>(tCols);
       step = static_cast<int16_t>(-stepCols);
     }
-    if (!scrollNameTo(from, finalOrigin, step)) return false;
-    nameStaticValid = true;
-    nameStaticOrigin = finalOrigin;
-    if (!settleNumber(finalOrigin)) return false;
-    return dualStillOk();
+    if (!scrollNameWithNumber(from, finalOrigin, step)) return false;
+    return finishDual(finalOrigin);
   }
 
   void tickNameTeeter() {
@@ -687,7 +915,7 @@ namespace {
     }
     uint16_t spd = parolaScrollSpeed(speed);
     if (resolved == ShowMode::ANIMATION) {
-      spd = 4;
+      spd = 6;
     }
     return runZoneAnim(zone, text, inEff, PA_NO_EFFECT, spd, pauseMs, gen, slot);
   }
@@ -780,7 +1008,85 @@ namespace {
 
     // Number zone only — do not redraw/restart name teeter or transitions.
     formatCount(newCount);
-    return runEffectAnim(z, numBuf, effect, 25, 100, gen, AnimSlot::Num);
+    return runEffectAnim(z, numBuf, effect, 35, 80, gen, AnimSlot::Num);
+  }
+
+  void runCounterEnterAnim(uint8_t effect) {
+    board->displayShutdown(false);
+    board->setIntensity(effectiveIntensity());
+
+    const uint8_t eff = resolveEffect(effect);
+    const int8_t nz = nameZoneId();
+    const int8_t cz = numberZone();
+    const Counter& c = Counters::getConst(Counters::activeIndex());
+
+    formatCount(c.count);
+    strncpy(nameBuf, c.name, NAME_MAX_LEN);
+    nameBuf[NAME_MAX_LEN] = '\0';
+
+    const uint32_t nameGen = beginAnim(AnimSlot::Name);
+    const uint32_t numGen = beginAnim(AnimSlot::Num);
+
+    if (nz >= 0 && cz >= 0) {
+      if (!runNameInAnim(nz, nameBuf, eff, nameGen, cz, numBuf, numGen)) return;
+    } else if (cz >= 0) {
+      if (!runEffectAnim(cz, numBuf, eff, 40, 0, numGen, AnimSlot::Num)) return;
+    } else if (nz >= 0) {
+      if (!runNameInAnim(nz, nameBuf, eff, nameGen)) return;
+    }
+
+    if (Counters::blanked()) {
+      restoreBlankAfterAnim();
+    } else {
+      board->displayShutdown(false);
+      board->setIntensity(effectiveIntensity());
+    }
+  }
+
+  void runCountIncAnim(int32_t newCount, uint8_t effect) {
+    board->displayShutdown(false);
+    board->setIntensity(effectiveIntensity());
+    paintNameOnly();
+    const uint32_t gen = beginAnim(AnimSlot::Num);
+    bool ok;
+    if (isMilestone(newCount)) {
+      ok = playFireworks(newCount, gen);
+    } else {
+      ok = playCountAnim(newCount, resolveEffect(effect), gen);
+    }
+    if (ok) restoreBlankAfterAnim();
+  }
+
+  void runCountDecAnim(int32_t newCount, uint8_t effect) {
+    board->displayShutdown(false);
+    board->setIntensity(effectiveIntensity());
+    paintNameOnly();
+    const uint32_t gen = beginAnim(AnimSlot::Num);
+    if (playCountAnim(newCount, resolveEffect(effect), gen)) {
+      restoreBlankAfterAnim();
+    }
+  }
+
+  void drainPendingAnims() {
+    while (pendingAnim.kind != PendingKind::None) {
+      const PendingAnim job = pendingAnim;
+      pendingAnim.kind = PendingKind::None;
+      animBusy = true;
+      switch (job.kind) {
+        case PendingKind::CounterEnter:
+          runCounterEnterAnim(job.effect);
+          break;
+        case PendingKind::CountInc:
+          runCountIncAnim(job.count, job.effect);
+          break;
+        case PendingKind::CountDec:
+          runCountDecAnim(job.count, job.effect);
+          break;
+        default:
+          break;
+      }
+      animBusy = false;
+    }
   }
 }
 
@@ -805,6 +1111,8 @@ void begin() {
   if (MODULES_NAME > 0 && MODULES_NUMBER > 0) {
     board->setZone(0, 0, MODULES_NAME - 1);
     board->setZone(1, MODULES_NAME, MODULES_PER_BOARD - 1);
+    if (NAME_ZONE_FLIP_UD) board->setZoneEffect(0, true, PA_FLIP_UD);
+    if (NAME_ZONE_FLIP_LR) board->setZoneEffect(0, true, PA_FLIP_LR);
   } else {
     board->setZone(0, 0, MODULES_PER_BOARD - 1);
   }
@@ -883,20 +1191,12 @@ void onCountIncreased(int32_t newCount, uint8_t effect) {
     return;
   }
 
-  // Number-only anim gen — does not cancel name transitions/teeter.
-  const uint32_t gen = beginAnim(AnimSlot::Num);
-  board->displayShutdown(false);
-  board->setIntensity(effectiveIntensity());
-
-  bool ok;
-  if (isMilestone(newCount)) {
-    ok = playFireworks(newCount, gen);
-  } else {
-    ok = playCountAnim(newCount, resolveEffect(effect), gen);
-  }
-  if (ok) {
-    restoreBlankAfterAnim();
-  }
+  pendingAnim.kind = PendingKind::CountInc;
+  pendingAnim.effect = effect;
+  pendingAnim.count = newCount;
+  cancelInFlightAnims();
+  if (animBusy) return;
+  drainPendingAnims();
 }
 
 void onCountDecreased(int32_t newCount, uint8_t effect) {
@@ -906,12 +1206,12 @@ void onCountDecreased(int32_t newCount, uint8_t effect) {
     return;
   }
 
-  const uint32_t gen = beginAnim(AnimSlot::Num);
-  board->displayShutdown(false);
-  board->setIntensity(effectiveIntensity());
-  if (playCountAnim(newCount, resolveEffect(effect), gen)) {
-    restoreBlankAfterAnim();
-  }
+  pendingAnim.kind = PendingKind::CountDec;
+  pendingAnim.effect = effect;
+  pendingAnim.count = newCount;
+  cancelInFlightAnims();
+  if (animBusy) return;
+  drainPendingAnims();
 }
 
 void idleShowNext(int32_t /*count*/, uint8_t effect) {
@@ -924,36 +1224,12 @@ void idleShowNext(int32_t /*count*/, uint8_t effect) {
     return;
   }
 
-  board->displayShutdown(false);
-  board->setIntensity(effectiveIntensity());
-
-  const uint8_t eff = resolveEffect(effect);
-  const int8_t nz = nameZoneId();
-  const int8_t cz = numberZone();
-  const Counter& c = Counters::getConst(Counters::activeIndex());
-
-  formatCount(c.count);
-  strncpy(nameBuf, c.name, NAME_MAX_LEN);
-  nameBuf[NAME_MAX_LEN] = '\0';
-
-  const uint32_t nameGen = beginAnim(AnimSlot::Name);
-  const uint32_t numGen = beginAnim(AnimSlot::Num);
-
-  if (nz >= 0 && cz >= 0) {
-    // Name + number transition together with the same effect.
-    if (!runNameInAnim(nz, nameBuf, eff, nameGen, cz, numBuf, numGen)) return;
-  } else if (cz >= 0) {
-    if (!runEffectAnim(cz, numBuf, eff, 30, 0, numGen, AnimSlot::Num)) return;
-  } else if (nz >= 0) {
-    if (!runNameInAnim(nz, nameBuf, eff, nameGen)) return;
-  }
-
-  if (Counters::blanked()) {
-    restoreBlankAfterAnim();
-  } else {
-    board->displayShutdown(false);
-    board->setIntensity(effectiveIntensity());
-  }
+  pendingAnim.kind = PendingKind::CounterEnter;
+  pendingAnim.effect = effect;
+  pendingAnim.count = 0;
+  cancelInFlightAnims();
+  if (animBusy) return;
+  drainPendingAnims();
 }
 
 void selectShow(uint8_t effect) {
@@ -997,7 +1273,7 @@ void stopManualScroller(bool restore) {
   if (restore) applyBlankState();
 }
 
-void startManualScroller(uint8_t effect) {
+void startManualScroller(uint8_t effect, const char* text) {
   if (!inited || !board) return;
   if (!displayVisible()) {
     applyBlankState();
@@ -1006,10 +1282,10 @@ void startManualScroller(uint8_t effect) {
 
   stopNameTeeter();
   nameStaticValid = false;
-  beginAnim(AnimSlot::Name);
-  beginAnim(AnimSlot::Num);
+  const uint32_t nameGen = beginAnim(AnimSlot::Name);
+  const uint32_t numGen = beginAnim(AnimSlot::Num);
 
-  const char* msg = Counters::scrollMessage();
+  const char* msg = text ? text : Counters::scrollMessage();
   if (msg && msg[0]) {
     strncpy(scrollerBuf, msg, SCROLLER_MAX_LEN);
     scrollerBuf[SCROLLER_MAX_LEN] = '\0';
@@ -1019,6 +1295,13 @@ void startManualScroller(uint8_t effect) {
 
   const uint8_t resolved = resolveEffect(effect);
   scrollerDir = (resolved == ShowMode::RIGHT) ? PA_SCROLL_RIGHT : PA_SCROLL_LEFT;
+  const bool slideLeft = (scrollerDir == PA_SCROLL_LEFT);
+
+  // Scroll current scoreboard off before the marquee owns the panel.
+  if (!scrollDisplayedOff(slideLeft, nameGen, numGen)) {
+    // Cancelled — leave whatever is mid-frame; pending anim will take over.
+    return;
+  }
 
   const int8_t nz = nameZoneId();
   const int8_t cz = numberZone();
@@ -1035,7 +1318,7 @@ void startManualScroller(uint8_t effect) {
     board->displayClear(cz);
   }
 
-  const uint16_t spd = parolaScrollSpeed(30);
+  const uint16_t spd = parolaScrollSpeed(40);
   board->setCharSpacing(scrollerZone, 1);
   board->displayZoneText(scrollerZone, scrollerBuf, PA_LEFT, spd, 0, scrollerDir, scrollerDir);
   board->displayReset(scrollerZone);

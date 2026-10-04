@@ -9,6 +9,14 @@ struct Counter {
   int32_t count;
 };
 
+enum IdleKind : uint8_t { IdleCounter = 0, IdleMessage = 1 };
+
+struct IdleStep {
+  uint8_t kind;    // IdleKind
+  uint8_t index;   // counter or message index
+  uint8_t effect;  // ShowMode id for this step
+};
+
 namespace Counters {
   void begin();
   void load();
@@ -60,6 +68,10 @@ namespace Counters {
   uint8_t idleCycleSeconds();
   void setIdleCycleSeconds(uint8_t seconds);
 
+  // Seconds of inactivity before attract cycle starts (5–600)
+  uint16_t idleTimeoutSeconds();
+  void setIdleTimeoutSeconds(uint16_t seconds);
+
   // Transition / effect scroll speed 1 (slow) – 10 (fast)
   uint8_t scrollSpeed();
   void setScrollSpeed(uint8_t speed);
@@ -68,7 +80,15 @@ namespace Counters {
   uint8_t teeterSpeed();
   void setTeeterSpeed(uint8_t speed);
 
-  // Manual scroller marquee text (persisted)
-  const char* scrollMessage();
-  void setScrollMessage(const char* text);
+  // Scroller messages (message 0 = remote/web Show)
+  uint8_t scrollMessageCount();
+  const char* scrollMessage();                  // message 0
+  const char* scrollMessage(uint8_t index);
+  void setScrollMessage(const char* text);      // sets message 0
+  void setScrollMessages(const char* const* texts, uint8_t count);
+
+  // Idle playlist (empty = cycle enabled counters)
+  uint8_t idlePlaylistLen();
+  IdleStep idleStep(uint8_t index);
+  void setIdlePlaylist(const IdleStep* steps, uint8_t count);
 }

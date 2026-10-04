@@ -49,39 +49,17 @@ namespace {
   .mac { font-family:ui-monospace,Consolas,monospace; letter-spacing:.04em; }
   table { width:100%; border-collapse:collapse; font-size:.95rem; }
   th, td { text-align:left; padding:.4rem .3rem; border-bottom:1px solid var(--line); }
-  @media (max-width:600px){ .row,.row3{ grid-template-columns:1fr; } }
+  .list-row { display:grid; grid-template-columns:1fr auto; gap:.5rem; align-items:end; margin-bottom:.45rem; }
+  .list-row.playlist { grid-template-columns:1fr 1.2fr 1fr auto; }
+  .mini-actions { display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.35rem; }
+  .mini-actions button { padding:.3rem .65rem; font-size:.85rem; }
+  @media (max-width:600px){ .row,.row3{ grid-template-columns:1fr; } .list-row,.list-row.playlist{ grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
 <main>
   <h1>Ren Fest Counter</h1>
   <p class="sub">Configure counters, brightness, Wi‑Fi, and WiZ keys. SoftAP stays on for setup; join your LAN below when you want.</p>
-
-  <section>
-    <h2>Wi‑Fi</h2>
-    <p class="sub" style="margin:0 0 .5rem">SoftAP <code id="apSsidLabel">RenFest-Counter</code> stays on (config / OTA). Station joins your home network.</p>
-    <p>SoftAP: <span class="mac" id="apIp">—</span></p>
-    <p>Station: <span id="staStatus">—</span> <span class="mac" id="staIp"></span></p>
-    <div class="actions">
-      <button type="button" id="btnWifiScan">Scan networks</button>
-      <button type="button" class="secondary" id="btnWifiForget">Forget network</button>
-    </div>
-    <div class="row" style="margin-top:.75rem">
-      <div>
-        <label for="wifiSsid">Network</label>
-        <select id="wifiSsid"><option value="">— scan first —</option></select>
-      </div>
-      <div>
-        <label for="wifiPass">Password</label>
-        <input id="wifiPass" type="password" autocomplete="off"/>
-      </div>
-    </div>
-    <label for="wifiSsidManual">Or type SSID</label>
-    <input id="wifiSsidManual" type="text" maxlength="32" placeholder="optional if not in list"/>
-    <div class="actions">
-      <button type="button" id="btnWifiConnect">Connect</button>
-    </div>
-  </section>
 
   <section>
     <h2>Global</h2>
@@ -104,31 +82,27 @@ namespace {
 
   <section>
     <h2>Effects</h2>
-    <p class="sub" style="margin:0 0 .5rem">Defaults for idle cycle and physical buttons (keymap Anim overrides remote keys).</p>
-    <div class="row3">
+    <p class="sub" style="margin:0 0 .5rem">Default for idle cycle (keymap Anim overrides remote keys).</p>
+    <div class="row">
       <div>
         <label for="idleEffect">Idle cycle</label>
         <select id="idleEffect"></select>
-      </div>
-      <div>
-        <label for="localIncEffect">Local +</label>
-        <select id="localIncEffect"></select>
-      </div>
-      <div>
-        <label for="localDecEffect">Local −</label>
-        <select id="localDecEffect"></select>
-      </div>
-    </div>
-    <div class="row" style="margin-top:.75rem">
-      <div>
-        <label for="idleCycleSec">Idle cycle seconds (1–120)</label>
-        <input id="idleCycleSec" type="number" min="1" max="120"/>
       </div>
       <div></div>
     </div>
     <div class="row" style="margin-top:.75rem">
       <div>
-        <label for="scrollSpeed">Transition speed <span id="scrollSpeedVal">5</span></label>
+        <label for="idleTimeoutSec">Idle start seconds (5–600)</label>
+        <input id="idleTimeoutSec" type="number" min="5" max="600"/>
+      </div>
+      <div>
+        <label for="idleCycleSec">Idle cycle seconds (1–120)</label>
+        <input id="idleCycleSec" type="number" min="1" max="120"/>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.75rem">
+      <div>
+        <label for="scrollSpeed">Transition speed <span id="scrollSpeedVal">5</span> (1–10, up to 3× horiz.)</label>
         <input id="scrollSpeed" type="range" min="1" max="10" step="1"/>
       </div>
       <div>
@@ -140,12 +114,29 @@ namespace {
 
   <section>
     <h2>Scroller</h2>
-    <p class="sub" style="margin:0 0 .5rem">Custom marquee text. Assign keymap action <code>scroller</code> (Anim Left/Right). Toggle on the remote or use Show/Stop here.</p>
-    <label for="scrollMessage">Message</label>
-    <input id="scrollMessage" type="text" maxlength="64" placeholder="e.g. Welcome to the Ren Fest"/>
+    <p class="sub" style="margin:0 0 .5rem">Marquee texts. Message 1 is used by remote/web Show. Assign keymap action <code>scroller</code>.</p>
+    <div id="scrollMessages"></div>
+    <div class="mini-actions">
+      <button type="button" class="secondary" id="btnMsgAdd">+ message</button>
+      <button type="button" class="secondary" id="btnMsgRemove">− message</button>
+    </div>
     <div class="actions">
       <button type="button" id="btnScrollerShow">Show</button>
       <button type="button" class="secondary" id="btnScrollerStop">Stop</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Idle order</h2>
+    <p class="sub" style="margin:0 0 .5rem">Attract sequence. Empty / Counters only = cycle enabled counters. Anim applies per step (messages: Left/Right direction).</p>
+    <div class="mini-actions" style="margin:0 0 .6rem">
+      <button type="button" class="secondary" id="btnPlPresetCounters">Counters only</button>
+      <button type="button" class="secondary" id="btnPlPresetMessages">Messages only</button>
+      <button type="button" class="secondary" id="btnPlPresetPair">1 msg + 1 counter</button>
+    </div>
+    <div id="idlePlaylist"></div>
+    <div class="mini-actions">
+      <button type="button" class="secondary" id="btnPlAdd">+ step</button>
     </div>
   </section>
 
@@ -186,6 +177,32 @@ namespace {
     <button type="button" class="secondary" id="btnReload">Reload</button>
   </div>
   <p class="ok" id="status"></p>
+
+  <section>
+    <h2>Wi‑Fi</h2>
+    <p class="sub" style="margin:0 0 .5rem">SoftAP <code id="apSsidLabel">RenFest-Counter</code> stays on (config / OTA). Station joins your home network.</p>
+    <p>SoftAP: <span class="mac" id="apIp">—</span></p>
+    <p>Station: <span id="staStatus">—</span> <span class="mac" id="staIp"></span></p>
+    <div class="actions">
+      <button type="button" id="btnWifiScan">Scan networks</button>
+      <button type="button" class="secondary" id="btnWifiForget">Forget network</button>
+    </div>
+    <div class="row" style="margin-top:.75rem">
+      <div>
+        <label for="wifiSsid">Network</label>
+        <select id="wifiSsid"><option value="">— scan first —</option></select>
+      </div>
+      <div>
+        <label for="wifiPass">Password</label>
+        <input id="wifiPass" type="password" autocomplete="off"/>
+      </div>
+    </div>
+    <label for="wifiSsidManual">Or type SSID</label>
+    <input id="wifiSsidManual" type="text" maxlength="32" placeholder="optional if not in list"/>
+    <div class="actions">
+      <button type="button" id="btnWifiConnect">Connect</button>
+    </div>
+  </section>
 </main>
 <script>
 const ACTION_OPTS = [
@@ -241,16 +258,96 @@ function render(){
   el('lastMac').textContent = state.lastSeenMac || '—';
   el('linkMac').textContent = state.linkedMac || 'none (accept any)';
   fillAnimSelect('idleEffect', state.idleEffect);
-  fillAnimSelect('localIncEffect', state.localIncEffect);
-  fillAnimSelect('localDecEffect', state.localDecEffect);
   el('idleCycleSec').value = (state.idleCycleSeconds != null) ? state.idleCycleSeconds : 5;
+  el('idleTimeoutSec').value = (state.idleTimeoutSeconds != null) ? state.idleTimeoutSeconds : 30;
   const spd = (state.scrollSpeed != null) ? state.scrollSpeed : 5;
   el('scrollSpeed').value = spd;
   el('scrollSpeedVal').textContent = spd;
   const tspd = (state.teeterSpeed != null) ? state.teeterSpeed : 5;
   el('teeterSpeed').value = tspd;
   el('teeterSpeedVal').textContent = tspd;
-  el('scrollMessage').value = state.scrollMessage || '';
+
+  if (!Array.isArray(state.scrollMessages) || !state.scrollMessages.length) {
+    state.scrollMessages = [state.scrollMessage || ''];
+  }
+  if (!Array.isArray(state.idlePlaylist)) state.idlePlaylist = [];
+
+  const msgBox = el('scrollMessages');
+  msgBox.innerHTML = '';
+  state.scrollMessages.forEach((m,i)=>{
+    const d = document.createElement('div');
+    d.className = 'list-row';
+    const label = i===0 ? 'Message 1 (remote Show)' : ('Message ' + (i+1));
+    d.innerHTML = `
+      <div>
+        <label>${label}</label>
+        <input type="text" maxlength="64" data-msg="${i}" value="${escapeAttr(m||'')}" placeholder="marquee text"/>
+      </div>`;
+    msgBox.appendChild(d);
+  });
+  el('btnMsgAdd').disabled = state.scrollMessages.length >= 8;
+  el('btnMsgRemove').disabled = state.scrollMessages.length <= 1;
+
+  const plBox = el('idlePlaylist');
+  plBox.innerHTML = '';
+  const defaultEff = (state.idleEffect != null) ? state.idleEffect : 0;
+  state.idlePlaylist.forEach((step,i)=>{
+    const d = document.createElement('div');
+    d.className = 'list-row playlist';
+    const kind = (step.kind === 1) ? 1 : 0;
+    const eff = (step.effect != null) ? step.effect : defaultEff;
+    let idxOpts = '';
+    if (kind === 1) {
+      for (let m=0; m<state.scrollMessages.length; m++) {
+        idxOpts += `<option value="${m}" ${m===step.index?'selected':''}>Msg ${m+1}</option>`;
+      }
+    } else {
+      for (let c=0; c<state.counters.length; c++) {
+        const nm = state.counters[c]?.name || ('CNT'+(c+1));
+        idxOpts += `<option value="${c}" ${c===step.index?'selected':''}>${c+1} — ${escapeAttr(nm)}</option>`;
+      }
+    }
+    d.innerHTML = `
+      <div>
+        <label>Type</label>
+        <select data-pl="${i}" data-f="kind">
+          <option value="0" ${kind===0?'selected':''}>Counter</option>
+          <option value="1" ${kind===1?'selected':''}>Message</option>
+        </select>
+      </div>
+      <div>
+        <label>Which</label>
+        <select data-pl="${i}" data-f="index">${idxOpts}</select>
+      </div>
+      <div>
+        <label>Anim</label>
+        <select data-pl="${i}" data-f="effect">${animOptions(eff)}</select>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button type="button" class="secondary" data-pl-rm="${i}">−</button>
+      </div>`;
+    plBox.appendChild(d);
+  });
+  plBox.querySelectorAll('select[data-f=kind]').forEach(s=>{
+    s.addEventListener('change', ev=>{
+      syncMessagesFromDom();
+      syncPlaylistFromDom();
+      const i = +ev.target.dataset.pl;
+      state.idlePlaylist[i].kind = +ev.target.value;
+      state.idlePlaylist[i].index = 0;
+      render();
+    });
+  });
+  plBox.querySelectorAll('button[data-pl-rm]').forEach(b=>{
+    b.addEventListener('click', ev=>{
+      syncMessagesFromDom();
+      syncPlaylistFromDom();
+      const i = +ev.currentTarget.dataset.plRm;
+      state.idlePlaylist.splice(i, 1);
+      render();
+    });
+  });
 
   const box = el('counters');
   box.innerHTML = '';
@@ -318,18 +415,43 @@ function escapeAttr(s){
   return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
 }
 
+function syncMessagesFromDom(){
+  if (!state.scrollMessages) state.scrollMessages = [''];
+  state.scrollMessages = state.scrollMessages.map((_,i)=>{
+    const inp = document.querySelector(`input[data-msg="${i}"]`);
+    return inp ? inp.value : '';
+  });
+}
+
+function syncPlaylistFromDom(){
+  if (!state.idlePlaylist) state.idlePlaylist = [];
+  const defaultEff = (state.idleEffect != null) ? state.idleEffect : 0;
+  state.idlePlaylist = state.idlePlaylist.map((step,i)=>{
+    const kindEl = document.querySelector(`select[data-pl="${i}"][data-f=kind]`);
+    const idxEl = document.querySelector(`select[data-pl="${i}"][data-f=index]`);
+    const effEl = document.querySelector(`select[data-pl="${i}"][data-f=effect]`);
+    return {
+      kind: kindEl ? +kindEl.value : (step.kind||0),
+      index: idxEl ? +idxEl.value : (step.index||0),
+      effect: effEl ? +effEl.value : (step.effect != null ? step.effect : defaultEff)
+    };
+  });
+}
+
 function collect(){
+  syncMessagesFromDom();
+  syncPlaylistFromDom();
   const body = {
     intensity: +el('intensity').value,
     blanked: el('blanked').checked,
     blankBrightnessPercent: +el('blankPct').value,
     idleEffect: +el('idleEffect').value,
-    localIncEffect: +el('localIncEffect').value,
-    localDecEffect: +el('localDecEffect').value,
     idleCycleSeconds: +el('idleCycleSec').value,
+    idleTimeoutSeconds: +el('idleTimeoutSec').value,
     scrollSpeed: +el('scrollSpeed').value,
     teeterSpeed: +el('teeterSpeed').value,
-    scrollMessage: el('scrollMessage').value,
+    scrollMessages: state.scrollMessages.slice(),
+    idlePlaylist: state.idlePlaylist.slice(),
     counters: state.counters.map((c,i)=>{
       const name = document.querySelector(`input[data-i="${i}"][data-f=name]`).value;
       const count = +document.querySelector(`input[data-i="${i}"][data-f=count]`).value;
@@ -369,6 +491,69 @@ el('btnSave').onclick = async ()=>{
 };
 
 el('btnReload').onclick = ()=>load();
+
+el('btnMsgAdd').onclick = ()=>{
+  syncMessagesFromDom();
+  syncPlaylistFromDom();
+  if (state.scrollMessages.length >= 8) return;
+  state.scrollMessages.push('');
+  render();
+};
+el('btnMsgRemove').onclick = ()=>{
+  syncMessagesFromDom();
+  syncPlaylistFromDom();
+  if (state.scrollMessages.length <= 1) return;
+  state.scrollMessages.pop();
+  // Clamp playlist message indices
+  state.idlePlaylist.forEach(s=>{
+    if (s.kind===1 && s.index >= state.scrollMessages.length) s.index = state.scrollMessages.length-1;
+  });
+  render();
+};
+el('btnPlAdd').onclick = ()=>{
+  syncMessagesFromDom();
+  syncPlaylistFromDom();
+  if (state.idlePlaylist.length >= 16) return;
+  const eff = (state.idleEffect != null) ? state.idleEffect : 0;
+  state.idlePlaylist.push({kind:0, index:0, effect:eff});
+  render();
+};
+
+function applyIdlePreset(builder){
+  syncMessagesFromDom();
+  syncPlaylistFromDom();
+  state.idlePlaylist = builder();
+  render();
+}
+
+el('btnPlPresetCounters').onclick = ()=>{
+  applyIdlePreset(()=>[]);
+};
+el('btnPlPresetMessages').onclick = ()=>{
+  applyIdlePreset(()=>{
+    const eff = (state.idleEffect != null) ? state.idleEffect : 0;
+    const out = [];
+    for (let i=0; i<state.scrollMessages.length && out.length<16; i++) {
+      out.push({kind:1, index:i, effect:eff});
+    }
+    return out;
+  });
+};
+el('btnPlPresetPair').onclick = ()=>{
+  applyIdlePreset(()=>{
+    const eff = (state.idleEffect != null) ? state.idleEffect : 0;
+    const out = [];
+    const msgN = Math.max(1, state.scrollMessages.length);
+    let mi = 0;
+    for (let c=0; c<state.counters.length && out.length+1<16; c++) {
+      if (!state.counters[c].enabled) continue;
+      out.push({kind:1, index: mi % msgN, effect:eff});
+      out.push({kind:0, index:c, effect:eff});
+      mi++;
+    }
+    return out;
+  });
+};
 
 el('scrollSpeed').oninput = ()=>{
   el('scrollSpeedVal').textContent = el('scrollSpeed').value;
@@ -509,12 +694,25 @@ setInterval(async ()=>{
     doc["linkedMac"] = Counters::linkedRemoteMac();
     doc["lastSeenMac"] = WizRemote::lastSeenMac();
     doc["idleEffect"] = Counters::idleEffect();
-    doc["localIncEffect"] = Counters::localIncEffect();
-    doc["localDecEffect"] = Counters::localDecEffect();
     doc["idleCycleSeconds"] = Counters::idleCycleSeconds();
+    doc["idleTimeoutSeconds"] = Counters::idleTimeoutSeconds();
     doc["scrollSpeed"] = Counters::scrollSpeed();
     doc["teeterSpeed"] = Counters::teeterSpeed();
-    doc["scrollMessage"] = Counters::scrollMessage();
+    doc["scrollMessage"] = Counters::scrollMessage();  // legacy alias = message 0
+
+    JsonArray msgs = doc["scrollMessages"].to<JsonArray>();
+    for (uint8_t i = 0; i < Counters::scrollMessageCount(); i++) {
+      msgs.add(Counters::scrollMessage(i));
+    }
+
+    JsonArray playlist = doc["idlePlaylist"].to<JsonArray>();
+    for (uint8_t i = 0; i < Counters::idlePlaylistLen(); i++) {
+      IdleStep step = Counters::idleStep(i);
+      JsonObject o = playlist.add<JsonObject>();
+      o["kind"] = step.kind;
+      o["index"] = step.index;
+      o["effect"] = step.effect;
+    }
 
     JsonArray arr = doc["counters"].to<JsonArray>();
     for (uint8_t i = 0; i < MAX_COUNTERS; i++) {
@@ -565,14 +763,11 @@ setInterval(async ()=>{
     if (!doc["idleEffect"].isNull()) {
       Counters::setIdleEffect(doc["idleEffect"].as<uint8_t>());
     }
-    if (!doc["localIncEffect"].isNull()) {
-      Counters::setLocalIncEffect(doc["localIncEffect"].as<uint8_t>());
-    }
-    if (!doc["localDecEffect"].isNull()) {
-      Counters::setLocalDecEffect(doc["localDecEffect"].as<uint8_t>());
-    }
     if (!doc["idleCycleSeconds"].isNull()) {
       Counters::setIdleCycleSeconds(doc["idleCycleSeconds"].as<uint8_t>());
+    }
+    if (!doc["idleTimeoutSeconds"].isNull()) {
+      Counters::setIdleTimeoutSeconds(doc["idleTimeoutSeconds"].as<uint16_t>());
     }
     if (!doc["scrollSpeed"].isNull()) {
       Counters::setScrollSpeed(doc["scrollSpeed"].as<uint8_t>());
@@ -580,9 +775,48 @@ setInterval(async ()=>{
     if (!doc["teeterSpeed"].isNull()) {
       Counters::setTeeterSpeed(doc["teeterSpeed"].as<uint8_t>());
     }
-    if (!doc["scrollMessage"].isNull()) {
+
+    JsonArray msgs = doc["scrollMessages"].as<JsonArray>();
+    if (!msgs.isNull()) {
+      char bufs[MAX_SCROLL_MESSAGES][SCROLLER_MAX_LEN + 1];
+      const char* ptrs[MAX_SCROLL_MESSAGES];
+      uint8_t n = 0;
+      for (JsonVariant v : msgs) {
+        if (n >= MAX_SCROLL_MESSAGES) break;
+        const char* s = v.as<const char*>();
+        if (s) {
+          strncpy(bufs[n], s, SCROLLER_MAX_LEN);
+          bufs[n][SCROLLER_MAX_LEN] = '\0';
+        } else {
+          bufs[n][0] = '\0';
+        }
+        ptrs[n] = bufs[n];
+        n++;
+      }
+      if (n == 0) {
+        bufs[0][0] = '\0';
+        ptrs[0] = bufs[0];
+        n = 1;
+      }
+      Counters::setScrollMessages(ptrs, n);
+    } else if (!doc["scrollMessage"].isNull()) {
       const char* msg = doc["scrollMessage"].as<const char*>();
       Counters::setScrollMessage(msg ? msg : "");
+    }
+
+    JsonArray playlist = doc["idlePlaylist"].as<JsonArray>();
+    if (!playlist.isNull()) {
+      IdleStep steps[MAX_IDLE_PLAYLIST];
+      uint8_t n = 0;
+      for (JsonObject o : playlist) {
+        if (n >= MAX_IDLE_PLAYLIST) break;
+        IdleStep step;
+        step.kind = o["kind"].isNull() ? IdleCounter : o["kind"].as<uint8_t>();
+        step.index = o["index"].isNull() ? 0 : o["index"].as<uint8_t>();
+        step.effect = o["effect"].isNull() ? Counters::idleEffect() : o["effect"].as<uint8_t>();
+        steps[n++] = step;
+      }
+      Counters::setIdlePlaylist(steps, n);
     }
 
     JsonArray arr = doc["counters"].as<JsonArray>();

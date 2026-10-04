@@ -4,7 +4,6 @@
 #include "config.h"
 #include "counters.h"
 #include "display.h"
-#include "local_buttons.h"
 #include "remote_map.h"
 #include "wiz_remote.h"
 #include "web_ui.h"
@@ -25,7 +24,6 @@ void setup() {
   Counters::begin();
   RemoteMap::begin();
   Display::begin();
-  LocalButtons::begin();
   IdleCycle::begin();
 
   WifiMgr::begin();
@@ -43,7 +41,6 @@ void loop() {
   if (Ota::busy()) return;  // don't starve OTA transfer
 
   WifiMgr::loop();
-  LocalButtons::loop();
   WizRemote::loop();
   RemoteMap::loop();
   IdleCycle::loop();

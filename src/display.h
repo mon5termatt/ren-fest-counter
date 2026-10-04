@@ -18,8 +18,8 @@ namespace Display {
   void idleShowNext(int32_t count, uint8_t effect = 0);         // default Left
   void selectShow(uint8_t effect = 0);                          // default Left
 
-  // Manual marquee of Counters::scrollMessage(); effect Left/Right sets direction
-  void startManualScroller(uint8_t effect = 0);
+  // Manual marquee; text=nullptr uses Counters::scrollMessage() (message 0)
+  void startManualScroller(uint8_t effect = 0, const char* text = nullptr);
   // restore=true paints the scoreboard; false clears and leaves the next anim to fill
   void stopManualScroller(bool restore = true);
   bool scrollerActive();

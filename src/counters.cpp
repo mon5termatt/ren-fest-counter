@@ -15,9 +15,13 @@ namespace {
   uint8_t localIncEff = ShowMode::UP;
   uint8_t localDecEff = ShowMode::DOWN;
   uint8_t idleCycleSec = 5;
+  uint16_t idleTimeoutSec = 30;  // seconds before attract cycle starts
   uint8_t scrollSpd = 5;
   uint8_t teeterSpd = 5;
-  char scrollMsg[SCROLLER_MAX_LEN + 1] = "";
+  char scrollMessages[MAX_SCROLL_MESSAGES][SCROLLER_MAX_LEN + 1];
+  uint8_t scrollMsgCount = 1;
+  IdleStep idlePlaylist[MAX_IDLE_PLAYLIST];
+  uint8_t idlePlLen = 0;
   bool dirty = false;
 
   uint8_t clampEffect(uint8_t e) {
@@ -30,15 +34,34 @@ namespace {
     return s;
   }
 
+  uint16_t clampTimeoutSec(uint16_t s) {
+    if (s < 5) return 5;
+    if (s > 600) return 600;
+    return s;
+  }
+
   uint8_t clampScroll(uint8_t s) {
     if (s < 1) return 1;
     if (s > 10) return 10;
     return s;
   }
 
+  uint8_t clampMsgCount(uint8_t n) {
+    if (n < 1) return 1;
+    if (n > MAX_SCROLL_MESSAGES) return MAX_SCROLL_MESSAGES;
+    return n;
+  }
+
   void clampCount(int32_t& c) {
     if (c < 0) c = 0;
     if (c > COUNT_MAX) c = COUNT_MAX;
+  }
+
+  void clearMessages() {
+    for (uint8_t i = 0; i < MAX_SCROLL_MESSAGES; i++) {
+      scrollMessages[i][0] = '\0';
+    }
+    scrollMsgCount = 1;
   }
 
   void defaults() {
@@ -56,9 +79,11 @@ namespace {
     localIncEff = ShowMode::UP;
     localDecEff = ShowMode::DOWN;
     idleCycleSec = 5;
+    idleTimeoutSec = 30;
     scrollSpd = 5;
     teeterSpd = 5;
-    scrollMsg[0] = '\0';
+    clearMessages();
+    idlePlLen = 0;
   }
 }
 
@@ -94,16 +119,51 @@ void load() {
   localIncEff = clampEffect(prefs.getUChar("locIncEff", ShowMode::UP));
   localDecEff = clampEffect(prefs.getUChar("locDecEff", ShowMode::DOWN));
   idleCycleSec = clampCycleSec(prefs.getUChar("idleSec", 5));
+  idleTimeoutSec = clampTimeoutSec(prefs.getUShort("idleTo", 30));
   scrollSpd = clampScroll(prefs.getUChar("scrollSpd", 5));
   teeterSpd = clampScroll(prefs.getUChar("teeterSpd", 5));
 
-  {
+  clearMessages();
+  if (prefs.isKey("msgCnt")) {
+    scrollMsgCount = clampMsgCount(prefs.getUChar("msgCnt", 1));
+    for (uint8_t i = 0; i < scrollMsgCount; i++) {
+      char key[8];
+      snprintf(key, sizeof(key), "msg%u", i);
+      String sm = prefs.getString(key, "");
+      if (sm.length() > 0 && sm.length() <= SCROLLER_MAX_LEN) {
+        strncpy(scrollMessages[i], sm.c_str(), SCROLLER_MAX_LEN);
+        scrollMessages[i][SCROLLER_MAX_LEN] = '\0';
+      }
+    }
+  } else {
+    // Legacy single scrollMsg → message 0
     String sm = prefs.getString("scrollMsg", "");
     if (sm.length() > 0 && sm.length() <= SCROLLER_MAX_LEN) {
-      strncpy(scrollMsg, sm.c_str(), SCROLLER_MAX_LEN);
-      scrollMsg[SCROLLER_MAX_LEN] = '\0';
-    } else {
-      scrollMsg[0] = '\0';
+      strncpy(scrollMessages[0], sm.c_str(), SCROLLER_MAX_LEN);
+      scrollMessages[0][SCROLLER_MAX_LEN] = '\0';
+    }
+    scrollMsgCount = 1;
+  }
+
+  idlePlLen = 0;
+  if (prefs.isKey("plLen")) {
+    uint8_t n = prefs.getUChar("plLen", 0);
+    if (n > MAX_IDLE_PLAYLIST) n = MAX_IDLE_PLAYLIST;
+    for (uint8_t i = 0; i < n; i++) {
+      char key[8];
+      snprintf(key, sizeof(key), "pl%u", i);
+      uint16_t packed = prefs.getUShort(key, 0xFFFF);
+      if (packed == 0xFFFF) continue;
+      IdleStep step;
+      step.kind = static_cast<uint8_t>((packed >> 8) & 0xFF);
+      step.index = static_cast<uint8_t>(packed & 0xFF);
+      char ek[8];
+      snprintf(ek, sizeof(ek), "pe%u", i);
+      step.effect = clampEffect(prefs.getUChar(ek, idleEff));
+      if (step.kind > IdleMessage) continue;
+      if (step.kind == IdleCounter && step.index >= MAX_COUNTERS) continue;
+      if (step.kind == IdleMessage && step.index >= MAX_SCROLL_MESSAGES) continue;
+      idlePlaylist[idlePlLen++] = step;
     }
   }
 
@@ -142,9 +202,37 @@ void save() {
   prefs.putUChar("locIncEff", localIncEff);
   prefs.putUChar("locDecEff", localDecEff);
   prefs.putUChar("idleSec", idleCycleSec);
+  prefs.putUShort("idleTo", idleTimeoutSec);
   prefs.putUChar("scrollSpd", scrollSpd);
   prefs.putUChar("teeterSpd", teeterSpd);
-  prefs.putString("scrollMsg", scrollMsg);
+  prefs.putUChar("msgCnt", scrollMsgCount);
+  for (uint8_t i = 0; i < MAX_SCROLL_MESSAGES; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "msg%u", i);
+    if (i < scrollMsgCount) {
+      prefs.putString(key, scrollMessages[i]);
+    } else {
+      prefs.remove(key);
+    }
+  }
+  // Keep legacy key in sync for older tooling
+  prefs.putString("scrollMsg", scrollMessages[0]);
+
+  prefs.putUChar("plLen", idlePlLen);
+  for (uint8_t i = 0; i < MAX_IDLE_PLAYLIST; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "pl%u", i);
+    char ek[8];
+    snprintf(ek, sizeof(ek), "pe%u", i);
+    if (i < idlePlLen) {
+      uint16_t packed = static_cast<uint16_t>((idlePlaylist[i].kind << 8) | idlePlaylist[i].index);
+      prefs.putUShort(key, packed);
+      prefs.putUChar(ek, idlePlaylist[i].effect);
+    } else {
+      prefs.remove(key);
+      prefs.remove(ek);
+    }
+  }
 
   for (uint8_t i = 0; i < MAX_COUNTERS; i++) {
     char key[12];
@@ -321,6 +409,13 @@ void setIdleCycleSeconds(uint8_t seconds) {
   markDirty();
 }
 
+uint16_t idleTimeoutSeconds() { return idleTimeoutSec; }
+
+void setIdleTimeoutSeconds(uint16_t seconds) {
+  idleTimeoutSec = clampTimeoutSec(seconds);
+  markDirty();
+}
+
 uint8_t scrollSpeed() { return scrollSpd; }
 
 void setScrollSpeed(uint8_t speed) {
@@ -335,14 +430,66 @@ void setTeeterSpeed(uint8_t speed) {
   markDirty();
 }
 
-const char* scrollMessage() { return scrollMsg; }
+const char* scrollMessage() { return scrollMessages[0]; }
+
+const char* scrollMessage(uint8_t index) {
+  if (index >= scrollMsgCount) return "";
+  return scrollMessages[index];
+}
+
+uint8_t scrollMessageCount() { return scrollMsgCount; }
 
 void setScrollMessage(const char* text) {
   if (!text) {
-    scrollMsg[0] = '\0';
+    scrollMessages[0][0] = '\0';
   } else {
-    strncpy(scrollMsg, text, SCROLLER_MAX_LEN);
-    scrollMsg[SCROLLER_MAX_LEN] = '\0';
+    strncpy(scrollMessages[0], text, SCROLLER_MAX_LEN);
+    scrollMessages[0][SCROLLER_MAX_LEN] = '\0';
+  }
+  if (scrollMsgCount < 1) scrollMsgCount = 1;
+  markDirty();
+}
+
+void setScrollMessages(const char* const* texts, uint8_t count) {
+  clearMessages();
+  scrollMsgCount = clampMsgCount(count);
+  if (!texts) {
+    markDirty();
+    return;
+  }
+  for (uint8_t i = 0; i < scrollMsgCount; i++) {
+    if (texts[i]) {
+      strncpy(scrollMessages[i], texts[i], SCROLLER_MAX_LEN);
+      scrollMessages[i][SCROLLER_MAX_LEN] = '\0';
+    }
+  }
+  markDirty();
+}
+
+uint8_t idlePlaylistLen() { return idlePlLen; }
+
+IdleStep idleStep(uint8_t index) {
+  if (index >= idlePlLen) {
+    IdleStep empty = {IdleCounter, 0, ShowMode::LEFT};
+    return empty;
+  }
+  return idlePlaylist[index];
+}
+
+void setIdlePlaylist(const IdleStep* steps, uint8_t count) {
+  idlePlLen = 0;
+  if (!steps || count == 0) {
+    markDirty();
+    return;
+  }
+  if (count > MAX_IDLE_PLAYLIST) count = MAX_IDLE_PLAYLIST;
+  for (uint8_t i = 0; i < count; i++) {
+    IdleStep step = steps[i];
+    if (step.kind > IdleMessage) continue;
+    if (step.kind == IdleCounter && step.index >= MAX_COUNTERS) continue;
+    if (step.kind == IdleMessage && step.index >= MAX_SCROLL_MESSAGES) continue;
+    step.effect = clampEffect(step.effect);
+    idlePlaylist[idlePlLen++] = step;
   }
   markDirty();
 }

@@ -17,14 +17,25 @@ namespace {
     haveCreds = false;
     savedSsid[0] = '\0';
     savedPass[0] = '\0';
-    if (!prefs.begin("rfwifi", true)) return;
-    String s = prefs.getString("ssid", "");
-    String p = prefs.getString("pass", "");
-    prefs.end();
-    if (s.length() == 0 || s.length() >= sizeof(savedSsid)) return;
-    strncpy(savedSsid, s.c_str(), sizeof(savedSsid) - 1);
-    strncpy(savedPass, p.c_str(), sizeof(savedPass) - 1);
-    haveCreds = true;
+    if (prefs.begin("rfwifi", true)) {
+      String s = prefs.getString("ssid", "");
+      String p = prefs.getString("pass", "");
+      prefs.end();
+      if (s.length() > 0 && s.length() < sizeof(savedSsid)) {
+        strncpy(savedSsid, s.c_str(), sizeof(savedSsid) - 1);
+        strncpy(savedPass, p.c_str(), sizeof(savedPass) - 1);
+        haveCreds = true;
+        return;
+      }
+    }
+    // Fall back to compile-time wifi_config.h
+    if (STA_SSID[0] != '\0') {
+      strncpy(savedSsid, STA_SSID, sizeof(savedSsid) - 1);
+      savedSsid[sizeof(savedSsid) - 1] = '\0';
+      strncpy(savedPass, STA_PASS, sizeof(savedPass) - 1);
+      savedPass[sizeof(savedPass) - 1] = '\0';
+      haveCreds = true;
+    }
   }
 
   void saveCreds(const char* ssid, const char* pass) {
